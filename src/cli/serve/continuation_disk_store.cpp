@@ -325,11 +325,10 @@ struct ParsedImage {
 /// startup indexing passes the stat size, full-image reads pass image.size().
 /// No checksum of the image is computed here.
 ParseFailure ParseImageHeader(std::span<const std::uint8_t> image,
-                               std::size_t expected_file_bytes,
-                               ParsedImage* parsed) {
+                              std::size_t expected_file_bytes,
+                              ParsedImage* parsed) {
   if (parsed == nullptr || image.size() < kHeaderBytes ||
-      !std::equal(kMagic.begin(), kMagic.end(),
-                  image.begin() + kMagicOffset)) {
+      !std::equal(kMagic.begin(), kMagic.end(), image.begin() + kMagicOffset)) {
     return ParseFailure::kCorrupt;
   }
 
@@ -417,8 +416,7 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   if (image == nullptr) {
     return ParseFailure::kCorrupt;
   }
-  const ParseFailure header =
-      ParseImageHeader(*image, image->size(), parsed);
+  const ParseFailure header = ParseImageHeader(*image, image->size(), parsed);
   if (header != ParseFailure::kNone) {
     return header;
   }
@@ -932,21 +930,18 @@ struct ContinuationDiskStore::Impl {
                                .filename = file.filename,
                                .file_bytes = file.file_bytes,
                                .last_access = last_access});
-            events.push_back(
-                {.action = ContinuationDiskEventAction::kSkipped,
-                 .reason = failure_reason,
-                 .file_bytes = file.file_bytes});
+            events.push_back({.action = ContinuationDiskEventAction::kSkipped,
+                              .reason = failure_reason,
+                              .file_bytes = file.file_bytes});
           } else {
             RemoveFileOnly(file.filename);
-            events.push_back(
-                {.action = ContinuationDiskEventAction::kRemoved,
-                 .reason = failure_reason,
-                 .file_bytes = file.file_bytes});
+            events.push_back({.action = ContinuationDiskEventAction::kRemoved,
+                              .reason = failure_reason,
+                              .file_bytes = file.file_bytes});
           }
           continue;
         }
-        const ParseFailure parse_failure =
-            ParseAndVerifyImage(&image, &parsed);
+        const ParseFailure parse_failure = ParseAndVerifyImage(&image, &parsed);
         if (parse_failure != ParseFailure::kNone) {
           RemoveFileOnly(file.filename);
           const std::lock_guard merge_lock(merge_mutex);
@@ -958,8 +953,7 @@ struct ContinuationDiskStore::Impl {
                .file_bytes = file.file_bytes});
           continue;
         }
-        const std::string digest =
-            HashKey(parsed.persistence, parsed.tokens);
+        const std::string digest = HashKey(parsed.persistence, parsed.tokens);
         const auto last_access = last_access_of(file.filename);
         const std::lock_guard merge_lock(merge_mutex);
         results.push_back({.kind = StartupResult::Kind::kVerified,
