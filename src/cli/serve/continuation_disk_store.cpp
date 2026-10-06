@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -890,12 +891,19 @@ struct ContinuationDiskStore::Impl {
     std::vector<ContinuationDiskEvent> events;
     std::vector<StartupResult> results;
     std::mutex merge_mutex;
-    std::vector<std::jthread> workers;
     std::size_t next = 0;
     const auto worker_count = std::min<std::size_t>(
         startup_files.size(),
         std::max<std::size_t>(1, std::thread::hardware_concurrency()));
     std::mutex next_mutex;
+    std::exception_ptr worker_failure;
+    const auto last_access_of = [&](const std::string& filename) {
+      std::error_code access_error;
+      const auto last_access = std::filesystem::last_write_time(
+          options.directory / filename, access_error);
+      return access_error ? std::filesystem::file_time_type::min()
+                          : last_access;
+    };
     const auto worker = [&] {
       while (true) {
         std::size_t position = 0;
@@ -912,11 +920,18 @@ struct ContinuationDiskStore::Impl {
             ContinuationDiskEventReason::kCorrupt;
         ParsedImage parsed;
         if (!ReadImage(file.filename, &image, &failure_reason)) {
+          // Accounted files keep their mtime so retention evicts them in
+          // the same LRU order as verified files.
+          const auto last_access =
+              failure_reason == ContinuationDiskEventReason::kStagingCapacity
+                  ? last_access_of(file.filename)
+                  : std::filesystem::file_time_type::min();
           const std::lock_guard merge_lock(merge_mutex);
           if (failure_reason == ContinuationDiskEventReason::kStagingCapacity) {
             results.push_back({.kind = StartupResult::Kind::kAccounted,
                                .filename = file.filename,
-                               .file_bytes = file.file_bytes});
+                               .file_bytes = file.file_bytes,
+                               .last_access = last_access});
             events.push_back(
                 {.action = ContinuationDiskEventAction::kSkipped,
                  .reason = failure_reason,
@@ -945,13 +960,7 @@ struct ContinuationDiskStore::Impl {
         }
         const std::string digest =
             HashKey(parsed.persistence, parsed.tokens);
-        std::error_code access_error;
-        auto last_access =
-            std::filesystem::last_write_time(options.directory / file.filename,
-                                             access_error);
-        if (access_error) {
-          last_access = std::filesystem::file_time_type::min();
-        }
+        const auto last_access = last_access_of(file.filename);
         const std::lock_guard merge_lock(merge_mutex);
         results.push_back({.kind = StartupResult::Kind::kVerified,
                            .filename = std::move(file.filename),
@@ -961,10 +970,30 @@ struct ContinuationDiskStore::Impl {
                            .digest = std::move(digest)});
       }
     };
+    // An exception (e.g. from the key hash callback) must not escape a
+    // worker thread: keep the first one, stop handing out files, join, and
+    // rethrow it from the constructor as a serial startup would.
+    const auto guarded_worker = [&] {
+      try {
+        worker();
+      } catch (...) {
+        const std::lock_guard next_lock(next_mutex);
+        if (!worker_failure) {
+          worker_failure = std::current_exception();
+        }
+        next = startup_files.size();
+      }
+    };
+    // Declared after everything the workers use, so an unwind joins them
+    // before those locals are destroyed.
+    std::vector<std::jthread> workers;
     for (std::size_t worker_id = 0; worker_id < worker_count; ++worker_id) {
-      workers.emplace_back(worker);
+      workers.emplace_back(guarded_worker);
     }
     workers.clear();
+    if (worker_failure) {
+      std::rethrow_exception(worker_failure);
+    }
     // Serial merge: emit the collected events, account the skipped files,
     // then index the verified survivors oldest-access first so duplicate
     // resolution keeps the newer copy, exactly as a serial startup would.

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -617,6 +618,67 @@ void TestSmallerStagingPreservesExistingFiles() {
   }
 }
 
+void TestPreservedOversizedFilesKeepLruOrder() {
+  const FakeRunner runner("staging-lru");
+  const auto file_bytes = ExpectedFileBytes(11, 2);
+  // Run both mtime orientations so the result cannot depend on filename or
+  // directory order.
+  for (const bool newer_first : {true, false}) {
+    TemporaryDirectory directory;
+    {
+      ContinuationDiskStore store(StoreOptions(directory.path()));
+      const auto snapshot = MakeSnapshot(runner, 42, 2);
+      Expect(SaveTokens(store, runner, {1, 2}, *snapshot).file_bytes ==
+                     file_bytes &&
+                 SaveTokens(store, runner, {3, 4}, *snapshot).file_bytes ==
+                     file_bytes,
+             "two equal-sized LRU fixtures store");
+    }
+    auto files = CacheFiles(directory.path());
+    Expect(files.size() == 2, "two LRU fixture files exist");
+    std::ranges::sort(files);
+    const auto newer = newer_first ? files.front() : files.back();
+    const auto older = newer_first ? files.back() : files.front();
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(newer, now - std::chrono::hours(1));
+    std::filesystem::last_write_time(older, now - std::chrono::hours(2));
+
+    // Both files exceed staging and only one fits the disk budget.
+    ContinuationDiskStore store(
+        StoreOptions(directory.path(), file_bytes, file_bytes - 1));
+    Expect(store.entry_count() == 1 && std::filesystem::exists(newer) &&
+               !std::filesystem::exists(older),
+           "preserved oversized files keep their LRU timestamps");
+  }
+}
+
+void TestStartupKeyHashExceptionReachesCaller() {
+  TemporaryDirectory directory;
+  const FakeRunner runner("startup-throw");
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    for (const TextRunnerToken token : {1, 2, 3}) {
+      Expect(SaveTokens(store, runner, {token, 2},
+                        *MakeSnapshot(runner, 42 + token, 2))
+                 .stored,
+             "startup exception fixture stores");
+    }
+  }
+  bool caught = false;
+  try {
+    const ContinuationDiskStore store(
+        StoreOptions(directory.path()), {},
+        [](std::span<const std::uint8_t>) -> std::string {
+          throw std::runtime_error("startup key failure");
+        });
+  } catch (const std::runtime_error& error) {
+    caught = std::string_view(error.what()) == "startup key failure";
+  }
+  Expect(caught, "startup key hash exceptions propagate from the constructor");
+  Expect(CacheFiles(directory.path()).size() == 3,
+         "a failed startup leaves the valid files in place");
+}
+
 void TestLruEvictionUsesActualFileBytes() {
   TemporaryDirectory directory;
   const FakeRunner runner("12345678");
@@ -1171,6 +1233,8 @@ int main() {
   TestByteAndStagingLimits();
   TestAutomaticStagingAndAdmissionDiagnostics();
   TestSmallerStagingPreservesExistingFiles();
+  TestPreservedOversizedFilesKeepLruOrder();
+  TestStartupKeyHashExceptionReachesCaller();
   TestLruEvictionUsesActualFileBytes();
   TestAtomicPublicationAndPrivatePermissions();
   TestStartupRejectsUnsafeAndInvalidFiles();
