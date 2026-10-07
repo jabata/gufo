@@ -1092,6 +1092,42 @@ void TestAppendedImagesReuseOnlyCompatiblePrefixes() {
          "image mismatch diagnostics retain the actual token agreement");
 }
 
+void TestRetryCopyUnderUnrelatedPressure() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  using gufo::server::SnapshotPurpose;
+  // Issue #451: a turn keeps its stable boundary {1, 2, 3} and, optionally,
+  // a full-prompt retry copy ending in assistant framing {4, 5}.
+  for (const std::size_t room : {3U, 8U}) {
+    std::vector<std::size_t> invalidations(1);
+    gufo::server::ContinuationCache cache(
+        1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+        {.restore = [](auto&, const auto&) {},
+         .capacity_bytes = [room] { return room * 8; },
+         .on_event = {}},
+        16);
+    const auto save = [&](const Tokens& tokens, SnapshotPurpose purpose) {
+      auto lease = cache.Acquire(tokens);
+      const bool admitted = lease.TryReserveSnapshot(
+          8, tokens.size(), purpose == SnapshotPurpose::kRetry, purpose);
+      if (admitted)
+        lease.Commit(tokens, std::make_unique<FakeSnapshot>(1, 8));
+      else
+        lease.Invalidate();
+      return admitted;
+    };
+    // Earlier unrelated conversations fill the budget when room == 3.
+    save({9, 9, 9}, SnapshotPurpose::kContinuation);
+    save({8, 8}, SnapshotPurpose::kContinuation);
+    save({7, 7, 7, 7}, SnapshotPurpose::kContinuation);
+    Expect(save({1, 2, 3}, SnapshotPurpose::kContinuation),
+           "the stable boundary evicts the oldest unrelated conversation");
+    const bool retry_kept = save({1, 2, 3, 4, 5}, SnapshotPurpose::kRetry);
+    const auto reused = cache.CachedPrefixTokens(Tokens{1, 2, 3, 4, 5});
+    std::cerr << "room=" << room << " retry_copy_admitted=" << retry_kept
+              << " identical_retry_reuses=" << reused << "/5\n";
+  }
+}
+
 int main() {
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
@@ -1114,6 +1150,7 @@ int main() {
   TestOptionalPublicationRechecksRecordPressure();
   TestNewConversationReplacesItsOwnHistoryFirst();
   TestRetryDoesNotDisplaceEarlierHistory();
+  TestRetryCopyUnderUnrelatedPressure();
   TestEditedTailReplacementPreservesSharedCheckpoints();
   TestReplacedSourceDoesNotEvictAnotherBranchTail();
   TestCacheCandidateDetailIsDebugTierOnly();
