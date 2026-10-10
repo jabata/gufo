@@ -253,8 +253,10 @@ configuration and prepared images) and closes with `kEnd`. Mirrored calls:
 
 - prefill chunks, single and batched advances, and single and batched
   multi-token MTP cycles. A cycle carries rank 0's sampler draw state so both
-  ranks draw alike; a batch also carries the draft count rank 0 chose from its
-  own cycle timings. A request with tools or a response format sends rank 1
+  ranks draw alike, and rank 0's draft count, so both ranks run cycles of the
+  same width even when their acceptance histories disagree; a greedy batch
+  carries one draft count for the whole batch, a sampled one each member's. A
+  request with tools or a response format sends rank 1
   what its constraint was built from (tools, response format, tool choice),
   and rank 1 builds the same constraint with the same code, so it judges
   drafts as rank 0 does; a constraint without that source decodes one token
