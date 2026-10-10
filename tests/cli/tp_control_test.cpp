@@ -289,7 +289,8 @@ int main() {
                               .index = 11,
                               .count = 8,
                               .rng = 0x0123456789abcdefULL,
-                              .pending = 248067}});
+                              .pending = 248067,
+                              .drafts = 5}});
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
               .instruction = {.op = TpInstructionOp::kEnd,
@@ -361,6 +362,11 @@ int main() {
                     {.sequence = command.sequence + 1, .state = 0, .count = 1}},
           .batch_drafts = 4}};
   round_trip(decode_batch);
+  // Without a shared plan, each member carries its own draft count instead.
+  auto member_plans = decode_batch;
+  member_plans.instruction.batch_drafts = 0;
+  member_plans.instruction.batch[0].drafts = 3;
+  round_trip(member_plans);
   // A capture carries the request's call count and digest so far.
   round_trip({.sequence = command.sequence,
               .kind = TpControlCommandKind::kInstruction,
@@ -460,6 +466,8 @@ int main() {
           with([](auto& bad) { bad.instruction.rng = 1; }));
   refuses("a pending draw outside a decode",
           with([](auto& bad) { bad.instruction.pending = 3; }));
+  refuses("a draft count outside a decode",
+          with([](auto& bad) { bad.instruction.drafts = 1; }));
   // Arguments that do not fit the operation.
   refuses("an empty prefill",
           with([](auto& bad) { bad.instruction.count = 0; }));
@@ -541,6 +549,11 @@ int main() {
           with_batch([](auto& bad) { bad.instruction.batch[0].count = 2; }));
   refuses("a draft plan outside a decode batch",
           with_batch([](auto& bad) { bad.instruction.batch_drafts = 2; }));
+  refuses("a batched advance member with a draft count",
+          with_batch([](auto& bad) { bad.instruction.batch[0].drafts = 1; }));
+  refuses("a member draft count beside a shared plan",
+          with_decode_batch(
+              [](auto& bad) { bad.instruction.batch[0].drafts = 2; }));
   refuses("members on a single advance", with([&](auto& bad) {
             bad.instruction = {.op = TpInstructionOp::kAdvance,
                                .token = 1,

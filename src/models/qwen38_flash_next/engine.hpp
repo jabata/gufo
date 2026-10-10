@@ -191,11 +191,19 @@ public:
   /// RNG consumption includes proposal and verification draws. A
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
-  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
-                                sampling::SamplerState& sampler,
-                                DecodeResult* result,
-                                std::string* error_msg = nullptr,
-                                bool stop_at_eos = true);
+  /// `forced_drafts`, when given, fixes the cycle's draft count instead of
+  /// choosing it from this session's acceptance history (a TP2 rank 0's
+  /// choice, mirrored so both ranks run cycles of the same width).
+  [[nodiscard]] bool DecodeStep(
+      std::size_t max_tokens, sampling::SamplerState& sampler,
+      DecodeResult* result, std::string* error_msg = nullptr,
+      bool stop_at_eos = true, std::optional<std::uint32_t> forced_drafts = {});
+  /// The draft count DecodeStep would choose for this budget: from the
+  /// session's acceptance history when the step would speculate at all, else
+  /// none (the step then uses its ordinary width). A TP2 peer's rank 0 chooses
+  /// it and the step runs with it on both ranks.
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecode(
+      std::size_t max_tokens) const;
   struct BatchOutcome {
     bool completed{false};
     std::string error{};
@@ -207,6 +215,9 @@ public:
     DecodeResult* result;
     bool stop_at_eos{true};
     BatchOutcome* outcome{nullptr};
+    /// This request's forced draft count (a TP2 peer's choice), overriding
+    /// the batch's shared plan.
+    std::optional<std::uint32_t> drafts{};
   };
   /// A false return may include completed peers. Inspect each outcome; only
   /// sessions whose persistent state was partly mutated become invalid.
@@ -333,6 +344,8 @@ private:
   static bool EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   struct PendingDecode;
+  /// `batch_drafts` forces the cycle's draft count for a batched step; a
+  /// request's own `drafts` overrides it.
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {});

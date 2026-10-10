@@ -1001,12 +1001,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool allow_subset =
       (unmodified && (concurrency == 1 || batch_drafts.has_value())) ||
       (concurrency == 1 && sampler.config().uses_random_sampling());
+  // A forced draft count (a TP2 rank 0's mirrored choice) overrides the
+  // session's own acceptance-history policy, so both ranks run cycles of the
+  // same width even when their histories have drifted apart.
+  const auto& forced = request.drafts ? request.drafts : batch_drafts;
   const std::size_t width =
       MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size())))
+          ? 1 + (forced ? std::min<std::uint32_t>(*forced, cap - 1)
+                        : draft_length_.Choose(
+                              static_cast<std::uint32_t>(cap - 1),
+                              static_cast<std::uint32_t>(tokens_.size())))
           : cap;
   if (width == 0) {
     result->stop = true;
@@ -1245,7 +1249,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
 
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
-                         std::string* error_msg, bool stop_at_eos) {
+                         std::string* error_msg, bool stop_at_eos,
+                         std::optional<std::uint32_t> forced_drafts) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -1254,7 +1259,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
-  const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  const DecodeRequest request{this,        max_tokens, &sampler,     result,
+                              stop_at_eos, nullptr,    forced_drafts};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg)) {
     return false;
@@ -1278,6 +1284,20 @@ bool Session::DecodeStep(std::size_t max_tokens,
   const bool ok = FinishDecode(request, pending, error_msg);
   valid_ = ok;
   return ok;
+}
+
+std::optional<std::uint32_t> Session::PlanDecode(std::size_t max_tokens) const {
+  if (!valid_ || !MtpEnabled()) {
+    return std::nullopt;
+  }
+  const std::size_t room = ContextSize() - tokens_.size();
+  const std::size_t cap = std::min<std::size_t>(
+      {max_tokens, room, model_->executor_->max_speculative()});
+  if (cap <= 1) {
+    return std::nullopt;
+  }
+  return draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
+                              static_cast<std::uint32_t>(tokens_.size()));
 }
 
 template<class Request>
@@ -1370,12 +1390,20 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
           session.lookup_.Restore(lookup_states[i]);
         }
         try {
-          if constexpr (std::is_same_v<Request, DecodeRequest>)
+          if constexpr (std::is_same_v<Request, DecodeRequest>) {
+            // The retry must run the cycle width the batch planned, or a
+            // TP2 peer's own policy could pick another and meet a different
+            // collective size.
+            const auto forced =
+                r.drafts ? r.drafts
+                         : (plan != nullptr ? *plan
+                                            : std::optional<std::uint32_t>{});
             outcome.completed =
                 session.DecodeStep(r.max_tokens, *r.sampler, r.result,
-                                   &outcome.error, r.stop_at_eos);
-          else
+                                   &outcome.error, r.stop_at_eos, forced);
+          } else {
             outcome.completed = session.Evaluate(r.token, &outcome.error);
+          }
         } catch (const std::exception& exception) {
           outcome.error = exception.what();
         }
@@ -1450,8 +1478,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                               std::string* error_msg) {
   if (requests.size() == 1) {
     const auto& r = requests.front();
-    r.outcome->completed = r.session->DecodeStep(
-        r.max_tokens, *r.sampler, r.result, &r.outcome->error, r.stop_at_eos);
+    // The forced draft count (a TP2 peer's plan) overrides this session's
+    // acceptance-history policy, exactly as in the batched path.
+    const auto forced =
+        r.drafts ? r.drafts
+                 : (plan != nullptr ? *plan : std::optional<std::uint32_t>{});
+    r.outcome->completed =
+        r.session->DecodeStep(r.max_tokens, *r.sampler, r.result,
+                              &r.outcome->error, r.stop_at_eos, forced);
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;

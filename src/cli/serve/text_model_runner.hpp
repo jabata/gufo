@@ -243,6 +243,9 @@ struct TextRunnerDecode {
   std::reference_wrapper<TextRunnerState> state;
   std::size_t max_tokens{0};
   std::reference_wrapper<sampling::SamplerState> sampler;
+  /// This member's forced draft count (a TP2 peer's choice), overriding the
+  /// batch's shared plan; none lets the runner choose.
+  std::optional<std::uint32_t> drafts{};
 };
 
 /// Coarse text-model adapter used by cache, scheduling, and HTTP layers.
@@ -390,6 +393,20 @@ public:
   [[nodiscard]] virtual TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const;
+  /// The plan of one multi-token decode step: the draft count the step would
+  /// use, when the runner chooses one (it may depend on acceptance history),
+  /// else none. A TP2 peer runs the step with the same plan, so both ranks
+  /// agree on its cycle width.
+  [[nodiscard]] virtual std::optional<std::uint32_t> PlanDecodeStep(
+      TextRunnerState&, std::size_t) const {
+    return std::nullopt;
+  }
+  /// DecodeStep with a plan from PlanDecodeStep, possibly made by a peer.
+  [[nodiscard]] virtual TextDecodeStep DecodeStepPlanned(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler, std::optional<std::uint32_t>) const {
+    return DecodeStep(state, max_tokens, sampler);
+  }
   [[nodiscard]] virtual std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const;
   /// The plan of a batched multi-token step: the draft count the whole batch

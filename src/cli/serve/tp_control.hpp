@@ -56,7 +56,8 @@ enum class TpInstructionOp : std::uint8_t {
   kAdvance = 3,
   /// `DecodeStep(state, count)`: one MTP draft-verify cycle. It carries rank
   /// 0's sampler draw state (`rng`, `pending`) from just before the call, so
-  /// rank 1's draws, and therefore its decisions, are rank 0's.
+  /// rank 1's draws, and therefore its decisions, are rank 0's, and rank 0's
+  /// draft count (`drafts`), so both ranks run cycles of the same width.
   kDecode = 4,
   /// The request is over. `count` is the number of instructions rank 0 sent
   /// for it and `digest` its execution digest; rank 1 compares both.
@@ -85,7 +86,7 @@ enum class TpInstructionOp : std::uint8_t {
   kRestoreDisk = 14,
   /// `DecodeBatch` over `batch`: one multi-token cycle for every member, with
   /// the batch's draft count from `batch_drafts` (the plan rank 0 chose, plus
-  /// one; zero lets each member choose from its own history). Sent with
+  /// one; zero lets each member use its own `drafts`). Sent with
   /// sequence 0; each member names its request and carries its budget and
   /// draw state, like `kDecode`.
   kDecodeBatch = 15,
@@ -102,6 +103,10 @@ struct TpBatchMember {
   std::uint32_t count{0};
   std::uint64_t rng{0};
   std::int32_t pending{-1};
+  /// kDecodeBatch only: the member's draft count plus one, or zero for none.
+  /// Used when the batch has no shared plan (`batch_drafts` is zero), so both
+  /// ranks run each member's cycle at the same width.
+  std::uint32_t drafts{0};
 
   bool operator==(const TpBatchMember&) const = default;
 };
@@ -130,6 +135,8 @@ struct TpInstruction {
   std::uint64_t file_key{0};
   /// kDecodeBatch only: the batch's draft count plus one, or zero for none.
   std::uint32_t batch_drafts{0};
+  /// kDecode only: the step's draft count plus one, or zero for none.
+  std::uint32_t drafts{0};
 
   bool operator==(const TpInstruction&) const = default;
 };

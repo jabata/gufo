@@ -908,15 +908,24 @@ TextDecodeStep TpMirroredRunner::DecodeStep(
   auto& mirrored = Mirrored(state);
   const auto count = ToWire(max_tokens, "decode budget");
   const auto draw = sampler.SaveDrawState();
-  const auto sent = Send(mirrored.id(), {.op = TpInstructionOp::kDecode,
-                                         .state = mirrored.id(),
-                                         .count = count,
-                                         .rng = draw.rng,
-                                         .pending = PendingToWire(draw)});
+  // Rank 0's draft count fixes the cycle width on both ranks: rank 1's own
+  // acceptance history could choose another and meet the trunk forward with
+  // a different all-reduce size.
+  const auto plan = inner_->PlanDecodeStep(mirrored.inner(), count);
+  const auto sent =
+      Send(mirrored.id(),
+           {.op = TpInstructionOp::kDecode,
+            .state = mirrored.id(),
+            .count = count,
+            .rng = draw.rng,
+            .pending = PendingToWire(draw),
+            .drafts = plan.has_value()
+                          ? ToWire(std::size_t{*plan} + 1, "draft count")
+                          : 0});
   TextDecodeStep step;
   try {
     CallScope scope(*this, sent.index);
-    step = inner_->DecodeStep(mirrored.inner(), count, sampler);
+    step = inner_->DecodeStepPlanned(mirrored.inner(), count, sampler, plan);
     scope.End();
   } catch (...) {
     Record(sent.sequence, DigestTpFailure);
@@ -960,6 +969,19 @@ std::vector<TextDecodeStep> TpMirroredRunner::DecodeBatch(
   const auto plan = inner_->PlanDecodeBatch(inner);
   instruction.batch_drafts =
       plan.has_value() ? ToWire(std::size_t{*plan} + 1, "draft count") : 0;
+  if (!plan.has_value()) {
+    // A batch without a shared plan (a sampled one) takes each member's own
+    // draft count; rank 0 chooses them and both ranks run the same widths.
+    for (std::size_t index = 0; index < inner.size(); ++index) {
+      const auto member_plan = inner_->PlanDecodeStep(inner[index].state.get(),
+                                                      inner[index].max_tokens);
+      instruction.batch[index].drafts =
+          member_plan.has_value()
+              ? ToWire(std::size_t{*member_plan} + 1, "draft count")
+              : 0;
+      inner[index].drafts = member_plan;
+    }
+  }
   const auto sent = SendBatch(instruction);
   std::vector<TextDecodeStep> steps;
   try {
@@ -1715,8 +1737,13 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         choice.reset();
         request.sampler.RestoreDrawState(
             DrawFromWire(instruction.rng, instruction.pending));
-        const auto step =
-            runner_->DecodeStep(state, instruction.count, request.sampler);
+        // Rank 0's draft count, which it chose from its own history.
+        const auto plan =
+            instruction.drafts != 0
+                ? std::optional<std::uint32_t>(instruction.drafts - 1)
+                : std::nullopt;
+        const auto step = runner_->DecodeStepPlanned(state, instruction.count,
+                                                     request.sampler, plan);
         for (const auto& selection : step.selections) {
           request.sampler.Accept(selection.token);
         }
@@ -1800,9 +1827,13 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
       choice.reset();
       request.sampler.RestoreDrawState(
           DrawFromWire(member.rng, member.pending));
-      decodes.push_back({.state = *states_[member.state],
-                         .max_tokens = member.count,
-                         .sampler = request.sampler});
+      decodes.push_back(
+          {.state = *states_[member.state],
+           .max_tokens = member.count,
+           .sampler = request.sampler,
+           .drafts = member.drafts != 0
+                         ? std::optional<std::uint32_t>(member.drafts - 1)
+                         : std::nullopt});
       continue;
     }
     const auto token = static_cast<TextRunnerToken>(member.token);

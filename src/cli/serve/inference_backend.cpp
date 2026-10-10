@@ -3187,6 +3187,25 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
+    return DecodeStepPlanned(state, max_tokens, sampler, std::nullopt);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeStep(
+      TextRunnerState& state, std::size_t max_tokens) const override {
+    if (!use_mtp_ || max_tokens <= 1) {
+      return std::nullopt;
+    }
+    auto& qfn = RequireQwenFlashNextState(state);
+    const auto budget =
+        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
+    return qfn.session().PlanDecode(budget);
+  }
+
+  /// `plan`, when given, fixes the cycle's draft count (a TP2 peer's choice).
+  [[nodiscard]] TextDecodeStep DecodeStepPlanned(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler,
+      std::optional<std::uint32_t> plan) const override {
     if (!use_mtp_ || max_tokens == 1) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
@@ -3207,7 +3226,7 @@ public:
     // Use the same request policy as SelectNext and the batched MTP path.
     // The engine stops before committing EOS or work beyond it.
     if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
-                                  qfn.stop_at_eos())) {
+                                  qfn.stop_at_eos(), plan)) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }
@@ -3314,7 +3333,8 @@ public:
           {&session,
            std::min<std::size_t>(decodes[i].max_tokens,
                                  std::uint64_t{max_draft_tokens_} + 1),
-           &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
+           &sampler, &results[i], state.stop_at_eos(), &outcomes[i],
+           decodes[i].drafts});
     }
     std::string error;
     (void)QwenFlashNextSession::DecodeBatch(requests, &error, plan);
