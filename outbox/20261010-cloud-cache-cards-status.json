@@ -1,0 +1,8 @@
+{
+  "id": "20261010-cloud-cache-cards-status",
+  "action": "pr_create",
+  "head": "cloud/cache-cards-status",
+  "title": "docs(cache): mark implemented cards done in the card index",
+  "body": "The card index in `docs/cache-redesign/cards/README.md` still listed cards 07, 10, 11, 12 and 13 as `agreed`. Their card files already say `done`, and their code is on main (#503, #507, #509, #515, #517). This updates those five table rows and the status paragraph, which still said only cards 02–06 were implemented.\n\nDocs only. It merges cleanly with the card-18 branch (`cloud/cache-capability-records`) and is rebased on main after #517.\n\nBuilt in a cloud session (CPU only); Strix Halo validation pending.\n\n> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope (Linux x86-64 cloud VM, no GPU): `python3 tools/ci/check-docs.py --root .` PASS (86 markdown files, 464 links/anchors). `tools/ci/check-pr-title.py` PASS. A script compared each card file's `Status:` with its table row; after this change no card disagrees. No build or tests ran; none apply to a docs-only change.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+  "draft": false
+}
