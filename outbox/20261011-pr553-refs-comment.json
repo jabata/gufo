@@ -1,0 +1,6 @@
+{
+ "id": "20261011-pr553-refs-comment",
+ "action": "comment",
+ "number": 553,
+ "body": "@headbouyJB thanks for testing `3ad61aa` on the 177K workload. Agreed: rounds 2 and 3 improve, but the deep-turn re-prefill you traced to the live-state handoff is still open, so this PR should not close #542. The description should say `Refs #542` instead of `Fixes #542`; that edit is pending. Thanks also for the follow-up that the state-selection change in rows 3 and 4 fails `tool-native-schemas`; that is noted for the follow-up work on #542.\n\n> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope: none. This comment only responds to the review notes. I ran nothing for it, and it makes no hardware claims.\n"
+}

@@ -1,0 +1,8 @@
+{
+ "id": "20261011-cache-ram-coresident-pr",
+ "action": "pr_create",
+ "head": "cloud/cache-ram-coresident",
+ "title": "docs(cache): warn that the automatic RAM budget ignores later co-resident servers",
+ "body": "Refs #387\n\nThe original report on #387 asked for a documentation warning about co-resident GPU servers. `docs/KV-CACHE.md` already says the RAM budget is sampled once after weights and execution states load, then fixed for the server run, and `docs/SERVER.md` covers the `CmaFree` subtraction from 88d2139. Neither says what that means for other GPU servers on the same machine. This PR adds four lines after the sizing example in `docs/KV-CACHE.md`:\n\n- Memory that another process claims after startup is not subtracted.\n- When an image or speech server shares the machine, set an explicit `--cache-ram-bytes` that leaves room for its peak use.\n- Starting those servers first only accounts for what they hold at that moment.\n\nThis PR does not change the budget itself. Rechecking live free memory, as discussed on #387, is a code decision for the maintainers.\n\nBuilt in a cloud session (CPU only); Strix Halo validation pending (docs only; nothing to validate on hardware).\n\n> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope: `python3 tools/ci/check-docs.py` passed on a CPU host (87 markdown files and 475 local links/anchors, none broken), and `tools/ci/check-pr-title.py` accepted the title. No build or other tests ran, because only documentation changed.\n",
+ "draft": false
+}
