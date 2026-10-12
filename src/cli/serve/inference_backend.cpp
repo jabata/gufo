@@ -3981,8 +3981,22 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                     : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,
             .vision_model_path = vision_model_path,
-            .decode_concurrency = static_cast<std::uint32_t>(
-                std::clamp<std::size_t>(session_count, 1, 8)),
+            // The MTP draft-length cost model assumes this many concurrent
+            // decoders. GUFO_MTP_POLICY_CONCURRENCY (1-8) overrides the
+            // configured session count, e.g. when many sessions are
+            // configured but usually only one or two decode at once.
+            .decode_concurrency =
+                static_cast<std::uint32_t>(std::clamp<std::size_t>(
+                    [&]() -> std::size_t {
+                      if (const char* v =
+                              std::getenv("GUFO_MTP_POLICY_CONCURRENCY")) {
+                        const long n = std::strtol(v, nullptr, 10);
+                        if (n >= 1 && n <= 8)
+                          return static_cast<std::size_t>(n);
+                      }
+                      return session_count;
+                    }(),
+                    1, 8)),
             .tp_rank = tp_config.rank,
             .tp_world_size = tp_config.world_size,
             .hip_device = tp_config.hip_device,
