@@ -1454,8 +1454,11 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
 }
 
 void TpExecutor::DropSnapshot(std::uint64_t id) {
-  if (id == 0 || id > last_snapshot_id_)
+  if (id == 0)
     throw std::logic_error("unknown snapshot drop ID");
+  // Rank 0 drops the ID of a capture that failed before this rank recorded
+  // it: retire the ID so that rank 0 cannot reuse it.
+  last_snapshot_id_ = std::max(last_snapshot_id_, id);
   const auto found = snapshots_.find(id);
   if (found != snapshots_.end()) {
     snapshot_bytes_ -= found->second->PayloadBytes();
@@ -1611,13 +1614,13 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
       case TpInstructionOp::kSnapshot: {
         if (instruction.snapshot_id <= last_snapshot_id_)
           throw std::logic_error("reused snapshot ID");
+        last_snapshot_id_ = instruction.snapshot_id;
         // Rank 0 sent the request's calls so far: capture only a state both
         // ranks reached the same way, so the snapshot is reusable at once.
         if (instruction.count != request.count ||
             instruction.digest != request.digest.value() ||
             !request.failure.empty())
           throw std::runtime_error("the ranks diverged before this capture");
-        last_snapshot_id_ = instruction.snapshot_id;
         const auto estimate = runner_->SnapshotPayloadBytes(state);
         if (estimate > snapshot_budget_ - snapshot_bytes_)
           throw std::runtime_error("worker snapshot budget exhausted");
