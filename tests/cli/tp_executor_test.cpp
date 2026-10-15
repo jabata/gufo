@@ -1136,6 +1136,46 @@ int main() {
       Require(executor.snapshot_count() == 0, "intact drop frees snapshot");
   }
 
+  // Rank 0 drops the ID of every capture that failed, including one rank 1
+  // refused or never received: the drop must not stop the worker.
+  {
+    auto runner = std::make_shared<ToyRunner>(ToyOptions{.cache = true});
+    TpExecutor executor(runner, 1);
+    const auto respond = [](const TpControlResponse&, std::string*) {
+      return true;
+    };
+    std::string error;
+    Require(executor.Execute(
+                {.sequence = 1, .max_tokens = 1, .prompt_tokens = {5, 9}},
+                respond, &error),
+            error);
+    for (const auto& call :
+         {gufo::server::TpInstruction{.op = TpInstructionOp::kPrefill,
+                                      .index = 0,
+                                      .count = 2,
+                                      .prompt_size = 2},
+          // Not the request's calls so far: rank 1 refuses the capture.
+          gufo::server::TpInstruction{.op = TpInstructionOp::kSnapshot,
+                                      .index = 1,
+                                      .count = 99,
+                                      .snapshot_id = 1}}) {
+      Require(executor.Execute({.sequence = 1,
+                                .kind = TpControlCommandKind::kInstruction,
+                                .instruction = call},
+                               respond, &error),
+              error);
+    }
+    for (const std::uint64_t id : {1, 2}) {
+      Require(executor.Execute({.kind = TpControlCommandKind::kInstruction,
+                                .instruction = {.op = TpInstructionOp::kDrop,
+                                                .index = id + 1,
+                                                .snapshot_id = id}},
+                               respond, &error),
+              "drop of an uncaptured snapshot ID: " + error);
+    }
+    Require(executor.snapshot_count() == 0, "refused capture keeps no copy");
+  }
+
   // Rank 1 refuses a stream that names requests it does not know.
   {
     auto runner = std::make_shared<ToyRunner>(ToyOptions{});
