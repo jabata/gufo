@@ -1877,16 +1877,25 @@ bool TpExecutor::ExecuteBatch(const TpInstruction& instruction,
                    " failed: " + what);
       continue;
     }
-    if (decode) {
-      for (const auto& selection : steps[index].selections) {
-        request.sampler.Accept(selection.token);
+    // As in ExecuteCall: a member whose constraint refuses the token fails
+    // its request, not the batch or the pair.
+    try {
+      if (decode) {
+        for (const auto& selection : steps[index].selections) {
+          request.sampler.Accept(selection.token);
+        }
+        DigestTpDecode(request.digest, steps[index],
+                       runner_->CheckpointPosition(state));
+      } else {
+        const auto token = static_cast<TextRunnerToken>(member.token);
+        request.sampler.Accept(token);
+        DigestTpAdvance(request.digest, runner_->CheckpointPosition(state));
       }
-      DigestTpDecode(request.digest, steps[index],
-                     runner_->CheckpointPosition(state));
-    } else {
-      const auto token = static_cast<TextRunnerToken>(member.token);
-      request.sampler.Accept(token);
-      DigestTpAdvance(request.digest, runner_->CheckpointPosition(state));
+    } catch (const std::exception& exception) {
+      DigestTpFailure(request.digest);
+      request.Note("rank 1 " + std::string(OpName(instruction.op)) +
+                   " failed: " + exception.what());
+      continue;
     }
     if (request.greedy) {
       try {

@@ -121,6 +121,9 @@ struct ToyOptions {
   bool extra_draft_once{false};
   /// Rank-1 fault: refuse to rebuild a request's prompt context.
   bool fail_context_decode{false};
+  /// Offer structured output. No toy piece is JSON, so a constraint refuses
+  /// every token.
+  bool constraint{false};
   /// Reported instead of the capabilities the options above imply.
   std::optional<TextRunnerCapabilities> capabilities;
 };
@@ -258,6 +261,16 @@ public:
           {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
     }
     return plans;
+  }
+  [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    if (!options_.constraint)
+      return TextModelRunner::BuildConstraintVocabulary();
+    return std::make_shared<const gufo::sampling::ConstraintVocabulary>(
+        static_cast<std::uint32_t>(kVocab), [](std::uint32_t id) {
+          return gufo::sampling::ConstraintVocabulary::Piece{
+              .text = Piece(static_cast<TextRunnerToken>(id))};
+        });
   }
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
@@ -1208,6 +1221,56 @@ int main() {
             respond, &error) &&
             error.find("not open") != std::string::npos,
         "a batch member of an unknown request is a protocol failure: " + error);
+  }
+
+  // A batch member whose rebuilt constraint refuses rank 0's token fails its
+  // request; the batch and rank 1 go on.
+  {
+    auto runner =
+        std::make_shared<ToyRunner>(ToyOptions{.width = 2, .constraint = true});
+    TpExecutor executor(runner, 2);
+    std::optional<std::string> verdict;
+    const auto respond = [&](const TpControlResponse& response, std::string*) {
+      if (response.kind == gufo::server::TpControlResponseKind::kSingle)
+        verdict = response.error;
+      return true;
+    };
+    std::string error;
+    Require(executor.Execute(
+                {.sequence = 1,
+                 .max_tokens = 4,
+                 .prompt_tokens = {5},
+                 .constrained = true,
+                 .constraint_source =
+                     gufo::server::TpConstraintSource{
+                         .response_format_json = R"({"type":"json_object"})"}},
+                respond, &error),
+            error);
+    Require(
+        executor.Execute({.sequence = 2, .max_tokens = 4, .prompt_tokens = {5}},
+                         respond, &error),
+        error);
+    Require(executor.Execute(
+                {.sequence = 0,
+                 .kind = TpControlCommandKind::kInstruction,
+                 .instruction =
+                     {.op = TpInstructionOp::kAdvanceBatch,
+                      .batch = {{.sequence = 1, .state = 0, .token = 7},
+                                {.sequence = 2, .state = 1, .token = 7}}}},
+                respond, &error),
+            "a refused batch token is not a protocol failure: " + error);
+    Require(executor.Execute({.sequence = 1,
+                              .kind = TpControlCommandKind::kInstruction,
+                              .instruction = {.op = TpInstructionOp::kEnd,
+                                              .index = 1,
+                                              .count = 1}},
+                             respond, &error),
+            error);
+    Require(verdict.has_value() &&
+                verdict->find("batched advance failed") != std::string::npos,
+            "the refused member's verdict names the failure: " +
+                verdict.value_or("none"));
+    Require(executor.open_requests() == 1, "the other member stays open");
   }
 
   // Rank 1 holds the other half of every snapshot, so an explicit RAM-cache
