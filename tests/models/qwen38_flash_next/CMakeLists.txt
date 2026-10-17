@@ -18,6 +18,7 @@ add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(tp_partition gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(rdma_gid gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
+add_qwen38_flash_next_test(draft_vocab gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -27,7 +28,7 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops)
+      select_ops snapshot_copy)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
 
@@ -78,6 +79,16 @@ if (ENGINE_ENABLE_HIP)
 
   add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_decode_attn_bench EXCLUDE_FROM_ALL
+    decode_attn_bench.cpp)
+  target_link_libraries(qwen38_flash_next_decode_attn_bench PRIVATE
+    gufo_qwen38_flash_next hip::host)
+
+  add_executable(qwen38_flash_next_routed_gemm_bench EXCLUDE_FROM_ALL
+    routed_gemm_bench.cpp)
+  target_link_libraries(qwen38_flash_next_routed_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp

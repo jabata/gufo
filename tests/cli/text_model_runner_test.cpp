@@ -2130,7 +2130,6 @@ void TestServerInstructionsAreFraming() {
   Expect(tokenizer != nullptr, "instruction tokenizer fixture initializes");
   ChatTemplateOptions options;
   options.enable_thinking = false;
-  options.require_tool_call = true;
   for (
       const auto schema :
       {R"({"type":"object","properties":{"text":{"type":"string","const":"\n</parameter>\n</｜DSML｜parameter>\\"}},"required":["text"],"additionalProperties":false})",

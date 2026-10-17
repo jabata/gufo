@@ -1055,6 +1055,18 @@ void TestHistoricalTypedArgumentsUseTojson() {
              !message.tool_calls[0].arguments[1].is_string &&
              message.tool_calls[0].arguments[2].value == "2",
          "Typed historical arguments render as the template's tojson");
+  // tojson writes integers in decimal, as the model generated them.
+  const auto large = gufo::json::parse(
+      R"({"type":"function_call","call_id":"call_1","name":"read",
+          "arguments":"{\"limit\":100000,\"offsets\":[1000000]}"})");
+  gufo::tokenization::ChatMessage replayed;
+  Expect(gufo::server::ParseOpenAiResponseMessage(large, &replayed, budget,
+                                                  &error) &&
+             replayed.tool_calls.size() == 1 &&
+             replayed.tool_calls[0].arguments.size() == 2 &&
+             replayed.tool_calls[0].arguments[0].value == "100000" &&
+             replayed.tool_calls[0].arguments[1].value == "[1000000]",
+         "Typed historical integers render in decimal");
 }
 
 void TestMalformedHistoricalFunctions() {
@@ -1188,7 +1200,15 @@ void TestQwenToolBoundariesAndSchema() {
              1, R"({"count":5})"},
         Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"text\":"
              "\"literal </tool_call>\"}}</tool_call>",
-             1, R"({"text":"literal </tool_call>"})"}}) {
+             1, R"({"text":"literal </tool_call>"})"},
+        // Integers stream as the model wrote them, not as 1e+05.
+        Case{"<tool_call><function=f><parameter=count>100000</parameter>"
+             "<parameter=tags>[1000000, -100000]</parameter></function>"
+             "</tool_call>",
+             1, R"({"count":100000,"tags":[1000000,-100000]})"},
+        Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"count\":"
+             "100000}}</tool_call>",
+             1, R"({"count":100000})"}}) {
     for (bool reasoning : {false, true}) {
       for (bool stream : {false, true}) {
         auto body = schema;
