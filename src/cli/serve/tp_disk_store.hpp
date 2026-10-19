@@ -55,6 +55,7 @@ public:
 
   [[nodiscard]] std::size_t entry_count() const;
   [[nodiscard]] std::size_t retained_bytes() const;
+  [[nodiscard]] std::size_t staging_capacity_bytes() const;
 
 private:
   struct Impl;

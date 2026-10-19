@@ -1523,7 +1523,12 @@ void TpExecutor::DropSnapshot(std::uint64_t id) {
   last_snapshot_id_ = std::max(last_snapshot_id_, id);
   const auto found = snapshots_.find(id);
   if (found != snapshots_.end()) {
-    snapshot_bytes_ -= found->second->PayloadBytes();
+    if (const auto staged = staged_.find(id); staged != staged_.end()) {
+      staged_bytes_ -= staged->second;
+      staged_.erase(staged);
+    } else {
+      snapshot_bytes_ -= found->second->PayloadBytes();
+    }
     snapshots_.erase(found);
   }
 }
@@ -1692,7 +1697,15 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
             !request.failure.empty())
           throw std::runtime_error("the ranks diverged before this capture");
         const auto estimate = runner_->SnapshotPayloadBytes(state);
-        if (estimate > snapshot_budget_ - snapshot_bytes_)
+        // Rank 0 captures a prompt its RAM cache refused for the disk cache
+        // alone, within disk staging. Without the same room here, a prompt
+        // whose snapshot exceeds the RAM budget would never reach the disk.
+        const std::size_t staging =
+            disk_ != nullptr && instruction.offset != 0
+                ? disk_->staging_capacity_bytes() - staged_bytes_
+                : 0;
+        const bool staged = estimate > snapshot_budget_ - snapshot_bytes_;
+        if (staged && estimate > staging)
           throw std::runtime_error("worker snapshot budget exhausted");
         // A snapshot for the disk cache is complete, as on rank 0: the
         // writer thread must not read rows the session still shares.
@@ -1702,10 +1715,15 @@ bool TpExecutor::ExecuteCall(std::uint64_t sequence, Request& request,
         if (!snapshot)
           throw std::runtime_error("snapshot capture returned null");
         const auto bytes = snapshot->PayloadBytes();
-        if (bytes > snapshot_budget_ - snapshot_bytes_)
+        if (bytes > (staged ? staging : snapshot_budget_ - snapshot_bytes_))
           throw std::runtime_error("worker snapshot exceeds reserved budget");
         snapshots_.emplace(instruction.snapshot_id, std::move(snapshot));
-        snapshot_bytes_ += bytes;
+        if (staged) {
+          staged_.emplace(instruction.snapshot_id, bytes);
+          staged_bytes_ += bytes;
+        } else {
+          snapshot_bytes_ += bytes;
+        }
         break;
       }
       case TpInstructionOp::kDrop:

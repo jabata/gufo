@@ -387,6 +387,10 @@ private:
   std::uint64_t last_snapshot_id_{0};
   const std::size_t snapshot_budget_;
   std::size_t snapshot_bytes_{0};
+  /// Complete snapshots beyond the budget, held for the disk cache within its
+  /// staging capacity, as rank 0 holds its half of them.
+  std::unordered_map<std::uint64_t, std::size_t> staged_;
+  std::size_t staged_bytes_{0};
   void DropSnapshot(std::uint64_t id);
   /// Shared with the disk store while it persists one.
   std::unordered_map<std::uint64_t, std::shared_ptr<TextRunnerSnapshot>>

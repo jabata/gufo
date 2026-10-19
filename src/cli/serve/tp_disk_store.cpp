@@ -384,4 +384,8 @@ std::size_t TpDiskStore::retained_bytes() const {
   return impl_->retained;
 }
 
+std::size_t TpDiskStore::staging_capacity_bytes() const {
+  return impl_->options.staging_capacity_bytes;
+}
+
 }  // namespace gufo::server

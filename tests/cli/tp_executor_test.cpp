@@ -537,9 +537,11 @@ void ToyState::SetCancellationCheck(const CancellationCheck&) {
 class Pair {
 public:
   /// With `disk0` and `disk1`, each rank keeps a disk cache there.
+  /// `snapshot_budget` is the RAM-cache limit both ranks agreed on.
   Pair(ToyOptions rank0_options, ToyOptions rank1_options,
        std::size_t sessions = 1, std::filesystem::path disk0 = {},
-       std::filesystem::path disk1 = {})
+       std::filesystem::path disk1 = {},
+       std::size_t snapshot_budget = std::numeric_limits<std::size_t>::max())
       : inner0_(std::make_shared<ToyRunner>(rank0_options)),
         runner1_(std::make_shared<ToyRunner>(rank1_options)) {
     const auto port = FreePort();
@@ -574,7 +576,8 @@ public:
     broker_ =
         std::make_shared<gufo::server::TpResponseBroker>(server_, sessions + 8);
     sink_ = std::make_shared<TpControlInstructionSink>(server_, broker_);
-    mirrored_ = std::make_shared<TpMirroredRunner>(inner0_, sink_);
+    mirrored_ =
+        std::make_shared<TpMirroredRunner>(inner0_, sink_, snapshot_budget);
     std::optional<gufo::server::TextRunnerDiskCacheOptions> disk_options;
     if (!disk0.empty()) {
       disk_options = gufo::server::TextRunnerDiskCacheOptions{
@@ -592,9 +595,9 @@ public:
               .staging_capacity_bytes = 1U << 20},
           persistence->compatibility_identity, persistence->payload_version);
     }
-    executor_ = std::make_unique<TpExecutor>(
-        runner1_, sessions, std::numeric_limits<std::size_t>::max(),
-        std::shared_ptr<TpCallScope>{}, disk1_);
+    executor_ =
+        std::make_unique<TpExecutor>(runner1_, sessions, snapshot_budget,
+                                     std::shared_ptr<TpCallScope>{}, disk1_);
     worker_ = std::thread([this] { Work(); });
   }
 
@@ -1748,6 +1751,33 @@ int main() {
       Require(run.result.tokens == first && !run.result.cache_disk_hit,
               what + ": a missing half is a miss");
     }
+    std::filesystem::remove_all(root);
+  }
+
+  // A prompt whose snapshot exceeds the RAM budget still reaches the disk on
+  // both ranks, and a repeat restores it.
+  {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("tp2-disk-budget-test-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const ToyOptions persist{
+        .cache = true, .persist = true, .cache_budget = 400};
+    std::vector<TextRunnerToken> large;
+    for (TextRunnerToken token = 0; token < 120; ++token)
+      large.push_back(10 + token);
+    const std::size_t stable = large.size() - 7;
+    Pair pair(persist, persist, 1, root / "rank0", root / "rank1", 400);
+    const auto cold = pair.Run(large, 3, {}, {}, {}, true, stable);
+    Require(cold.worker_error.empty(), "large prompt: " + cold.worker_error);
+    pair.WaitForRank1Disk(1);
+    const auto repeat = pair.Run(large, 3, {}, {}, {}, true, stable);
+    Require(repeat.worker_error.empty(),
+            "large repeat: " + repeat.worker_error);
+    Require(repeat.result.tokens == cold.result.tokens &&
+                repeat.result.cache_disk_hit &&
+                repeat.result.cached_prompt_tokens == stable,
+            "a snapshot beyond the RAM budget restores from disk");
+    pair.RequireSameCalls("large disk cache");
     std::filesystem::remove_all(root);
   }
 
