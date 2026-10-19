@@ -652,6 +652,7 @@ void TestInPassFailureRetainsOnlyCompletedCheckpoints() {
 class PersistentSnapshotRunner final : public SnapshotRunner {
 public:
   std::function<void()> before_serialize;
+  bool fail_restore{false};
   PersistentSnapshotRunner(std::shared_ptr<FakeStats> stats,
                            std::string identity,
                            std::size_t retained_snapshot_capacity_bytes = 256,
@@ -704,6 +705,8 @@ public:
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
+    if (fail_restore)
+      throw std::runtime_error("injected persistent restore failure");
     if (payload.size() != 4 * sizeof(std::uint64_t)) {
       throw std::invalid_argument("fake persistent payload size mismatch");
     }
@@ -1523,6 +1526,63 @@ void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
   old.Invalidate();
 }
 
+void TestDiskPrefixDeepensShortRamHit() {
+  // RAM holds one checkpoint, as a 2 GiB budget holds one 90K-token one.
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{
+      .directory = directory.path(),
+      .capacity_bytes = 1U << 20,
+      .staging_capacity_bytes = 1U << 20};
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(
+      stats, "artifact-A", sizeof(FakeSnapshot), 8192);
+  std::vector<TextRunnerToken> prompt(4200);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = static_cast<TextRunnerToken>(i + 1);
+  const std::size_t stable = prompt.size() - 7;
+  const auto run = [](TextRunnerPool& pool, std::vector<TextRunnerToken> tokens,
+                      std::size_t boundary) {
+    auto request = pool.Acquire(std::move(tokens), {}, {}, {}, true, boundary);
+    while (!request.Prefill(8192).decode_ready) {
+    }
+    (void)request.SelectNext();
+    request.Advance();
+    request.Commit();
+  };
+  const std::vector<TextRunnerToken> shared(prompt.begin(),
+                                            prompt.begin() + 100);
+  {
+    TextRunnerPool writer(runner, 1, disk_cache);
+    run(writer, shared, shared.size());
+    run(writer, prompt, stable);
+  }
+  TextRunnerPool pool(runner, 1, disk_cache);
+  // Another conversation leaves RAM only a short prefix of this prompt. Its
+  // exact disk restore queues no write that could hold the store busy.
+  run(pool, shared, shared.size());
+  auto deep = pool.Acquire(prompt, {}, {}, {}, true, stable);
+  Expect(deep.cache_disk_hit() && deep.cached_prompt_tokens() == stable,
+         "a much longer disk prefix replaces a short RAM restore");
+  Expect(deep.Prefill(8192).consumed_tokens == prompt.size() - stable,
+         "only the suffix after the disk prefix is prefilled");
+  deep.Invalidate();
+
+  std::vector<TextRunnerToken> near(prompt.begin(), prompt.begin() + 2000);
+  near.push_back(9000);
+  auto shallow = pool.Acquire(near, {}, {}, {}, true, near.size());
+  Expect(shallow.cache_hit() && !shallow.cache_disk_hit() &&
+             shallow.cached_prompt_tokens() == 100,
+         "no file is read when disk saves little prefill over RAM");
+  shallow.Invalidate();
+
+  runner->fail_restore = true;
+  auto failed = pool.Acquire(prompt, {}, {}, {}, true, stable);
+  Expect(!failed.cache_hit() && failed.cached_prompt_tokens() == 0 &&
+             failed.prefill_position() == 0,
+         "a failed deeper restore prefills from the start, not RAM's count");
+  failed.Invalidate();
+}
+
 void TestNewImageGetsAStableCheckpoint() {
   class ContextRunner final : public SnapshotRunner {
   public:
@@ -2329,6 +2389,7 @@ int main() {
   TestHistoryEditsRestoreIntermediateCheckpoints();
   TestChatFallbackSurvivesSnapshotBudgetPressure();
   TestFullChatCheckpointRestoresWithoutSuffixPrefill();
+  TestDiskPrefixDeepensShortRamHit();
   TestDiskOnlyCaptureReservesBudgetBeforeCommit();
   TestDiskPreflightAvoidsUnusableCapture();
   TestBoundedPrefillDecodeAndPrefixReuse();

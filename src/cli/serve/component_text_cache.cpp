@@ -1644,6 +1644,10 @@ void ServingCacheLease::AdoptRestoredPrefix(std::size_t tokens,
     throw std::logic_error("component restore is owned by the component cache");
   legacy_.AdoptRestoredPrefix(tokens, bytes, ms);
 }
+void ServingCacheLease::DropRestoredPrefix() noexcept {
+  if (!component_)
+    legacy_.DropRestoredPrefix();
+}
 void ServingCacheLease::PreparePrefill() {
   if (component_)
     component_->PreparePrefill();

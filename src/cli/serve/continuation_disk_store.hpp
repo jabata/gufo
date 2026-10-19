@@ -156,12 +156,15 @@ public:
   /// Restores the longest exact saved prefix of prompt into state. When a
   /// stable boundary is supplied, a later checkpoint requires an earlier
   /// saved prefix too, so legacy full-prompt files cannot bypass migration.
+  /// A longest prefix shorter than min_tokens is a miss that reads nothing
+  /// and leaves state untouched.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
       std::span<const std::uint8_t> input_identity = {},
       std::size_t stable_prefix_tokens = 0,
-      std::span<const ContinuationInputPrefix> input_prefixes = {});
+      std::span<const ContinuationInputPrefix> input_prefixes = {},
+      std::size_t min_tokens = 0);
 
   /// Prefix lengths that prompt shares with stored entries but that no entry
   /// holds exactly.

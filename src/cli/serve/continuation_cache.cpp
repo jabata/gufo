@@ -275,8 +275,9 @@ void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
   if (cache_ == nullptr) {
     throw std::logic_error("continuation cache lease is empty");
   }
-  if (cache_hit_ || cached_tokens == 0 || restored_bytes == 0 ||
-      restore_ms < 0.0) {
+  if ((cache_hit_ &&
+       (restored_from_disk_ || cached_tokens <= cached_tokens_)) ||
+      cached_tokens == 0 || restored_bytes == 0 || restore_ms < 0.0) {
     throw std::invalid_argument(
         "invalid lower-tier continuation restore metrics");
   }
@@ -286,6 +287,15 @@ void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
   restore_ms_ = restore_ms;
   restored_from_disk_ = true;
   lookup_ = {};
+}
+
+void ContinuationCache::Lease::DropRestoredPrefix() noexcept {
+  cache_hit_ = false;
+  cached_tokens_ = 0;
+  restored_snapshot_bytes_ = 0;
+  restore_ms_ = 0.0;
+  restored_from_disk_ = false;
+  lookup_ = {.miss_reason = "restore_failed"};
 }
 
 bool ContinuationCache::Lease::TryReserveSnapshot(

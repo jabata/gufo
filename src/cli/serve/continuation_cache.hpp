@@ -169,8 +169,13 @@ public:
         std::span<const ContinuationToken> tokens) const;
 
     /// Records a successful restore performed by an optional lower cache tier.
+    /// It may replace a shorter prefix this cache restored.
     void AdoptRestoredPrefix(std::size_t cached_tokens,
                              std::size_t restored_bytes, double restore_ms);
+
+    /// Records that a lower tier's failed restore reset the state this cache
+    /// restored, so the request prefills from the start.
+    void DropRestoredPrefix() noexcept;
 
     /// Reserves aggregate retained-snapshot capacity before model allocation.
     ///

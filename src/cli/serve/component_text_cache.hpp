@@ -141,6 +141,7 @@ public:
   [[nodiscard]] ContinuationLookup lookup() const noexcept;
   [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
   void AdoptRestoredPrefix(std::size_t, std::size_t, double);
+  void DropRestoredPrefix() noexcept;
   [[nodiscard]] bool TryReserveSnapshot(
       std::size_t, std::size_t, bool = false,
       SnapshotPurpose = SnapshotPurpose::kContinuation,

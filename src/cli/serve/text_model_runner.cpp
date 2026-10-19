@@ -171,6 +171,9 @@ std::size_t HostSnapshotCeilingBytes() {
 
 namespace {
 
+// The disk store's default checkpoint step: it keeps no files closer together.
+constexpr std::size_t kDiskOverRamMinTokens = 2048;
+
 struct ValidatedRunner {
   std::shared_ptr<TextModelRunner> runner;
   TextRunnerDescriptor descriptor;
@@ -2041,14 +2044,31 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       }
     }
   }
-  if (reuse_prompt && !lease.cache_hit() && impl_->disk_store != nullptr &&
+  // RAM can keep only a short prefix of a long prompt, such as a system
+  // prompt other conversations share, after evicting this conversation's own
+  // checkpoint for its size. Its disk copy then saves the rest of the prefill.
+  // A restore reads the whole checkpoint, so it must skip a real share of the
+  // prompt. A live frontier needs no copy and is never replaced.
+  const bool snapshot_hit = lease.cache_hit() && !lease.restored_from_disk() &&
+                            lease.restored_snapshot_bytes() != 0;
+  const auto disk_min_tokens =
+      snapshot_hit ? lease.cached_tokens() +
+                         std::max(kDiskOverRamMinTokens, prompt.size() / 8)
+                   : 0;
+  if (reuse_prompt && (!lease.cache_hit() || snapshot_hit) &&
+      disk_min_tokens <= prompt.size() && impl_->disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
     const auto restore_start = std::chrono::steady_clock::now();
+    const auto reset = [&] {
+      auto& state = dynamic_cast<TextRunnerState&>(lease.state());
+      state.SetCancellationCheck(is_cancelled);
+      impl_->validated.runner->SetPromptContext(state, context);
+    };
     try {
       const auto restored = impl_->disk_store->RestoreLongestPrefix(
           *impl_->validated.runner,
           dynamic_cast<TextRunnerState&>(lease.state()), prompt, identity,
-          cache_prefix_tokens, input_prefixes);
+          cache_prefix_tokens, input_prefixes, disk_min_tokens);
       if (restored.restored) {
         if (context)
           impl_->validated.runner->SetPromptContext(
@@ -2058,16 +2078,20 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - restore_start)
                 .count());
-      } else {
-        auto& state = dynamic_cast<TextRunnerState&>(lease.state());
-        state.SetCancellationCheck(is_cancelled);
-        impl_->validated.runner->SetPromptContext(state, context);
+      } else if (!snapshot_hit) {
+        reset();
+      } else if (impl_->validated.runner->CheckpointPosition(
+                     dynamic_cast<const TextRunnerState&>(lease.state())) !=
+                 lease.cached_tokens()) {
+        // A failed file restore reset the state RAM restored.
+        lease.DropRestoredPrefix();
+        reset();
       }
     } catch (...) {
       lease.state().Invalidate();
-      auto& state = dynamic_cast<TextRunnerState&>(lease.state());
-      state.SetCancellationCheck(is_cancelled);
-      impl_->validated.runner->SetPromptContext(state, context);
+      if (snapshot_hit)
+        lease.DropRestoredPrefix();
+      reset();
     }
   }
   std::vector<std::size_t> boundaries;
