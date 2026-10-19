@@ -415,7 +415,6 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
     case ContinuationDiskEventReason::kHit:
     case ContinuationDiskEventReason::kNotFound:
     case ContinuationDiskEventReason::kExactReplacement:
-    case ContinuationDiskEventReason::kBusy:
       return;
     case ContinuationDiskEventReason::kByteCapacity:
       if (event.action == ContinuationDiskEventAction::kRemoved)
@@ -439,11 +438,13 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
       line << " write_ms=" << event.elapsed_ms;
       Logger::Info("cache", line.str());
     } else if (event.reason == ContinuationDiskEventReason::kLru ||
-               event.reason == ContinuationDiskEventReason::kMinStep) {
+               event.reason == ContinuationDiskEventReason::kMinStep ||
+               event.reason == ContinuationDiskEventReason::kBusy) {
       // Staying inside a configured budget or skipping a checkpoint that
       // barely advances is expected operation, but it has to be visible:
       // otherwise a run that evicts every other conversation looks identical
-      // to one that never cached anything.
+      // to one that never cached anything. So does a restore skipped while a
+      // write updates the index, which prefills what the file holds.
       Logger::Info("cache", line.str());
     } else {
       Logger::Warn("cache", line.str());
@@ -996,8 +997,11 @@ struct TextRunnerPool::Request::Impl {
             std::chrono::steady_clock::now() - snapshot_start)
             .count();
     if (prompt_snapshot == nullptr) {
+      // A disk-only capture fails silently otherwise, and the prompt then
+      // misses both tiers on every repeat.
+      const bool disk_only = disk_capture != nullptr;
       disk_capture.reset();
-      if (retain_snapshot) {
+      if (retain_snapshot || disk_only) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
                            snapshot_tokens.size());
       }
