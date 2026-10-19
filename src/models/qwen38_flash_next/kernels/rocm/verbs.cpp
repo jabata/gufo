@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/distributed/rdma_gid.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_keepalive.hpp"
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -82,14 +83,9 @@ constexpr std::size_t kReadyOffset = 0;
 constexpr std::size_t kArrivedOffset = 64;
 constexpr std::size_t kTimedOutOffset = 128;
 constexpr std::size_t kFlagBytes = 4096;
-constexpr auto kCollectiveTimeout = std::chrono::seconds(30);
 // A living peer may fall far behind, e.g. while its n-gram reads wait on a
-// throttled SSD; a dead one closes the bootstrap socket, and a vanished host
-// fails its TCP keepalive, both long before this.
+// throttled SSD; a dead one closes the bootstrap socket long before this.
 constexpr auto kExchangeTimeout = std::chrono::seconds(180);
-constexpr int kKeepaliveIdleSeconds = 10;
-constexpr int kKeepaliveIntervalSeconds = 5;
-constexpr int kKeepaliveProbes = 3;
 constexpr auto kReceiveSpinWindow = std::chrono::microseconds(500);
 // An exchange waits for a layer of GPU work, or a peer that is a layer behind:
 // spinning that long keeps the wake-up latency off every decode exchange.
@@ -291,7 +287,11 @@ public:
     }
     SetTimeouts(fd);
     pollfd poll_fd{.fd = fd, .events = POLLIN, .revents = 0};
-    const int poll_result = ::poll(&poll_fd, 1, 30000);
+    const int poll_result = ::poll(
+        &poll_fd, 1,
+        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             distributed::kTpBootstrapWindow)
+                             .count()));
     if (poll_result <= 0) {
       SetError(error, poll_result == 0 ? "bootstrap accept timed out"
                                        : SystemError("bootstrap poll"));
@@ -318,7 +318,8 @@ public:
       SetError(error, "rank one requires a bootstrap host");
       return {};
     }
-    const auto deadline = std::chrono::steady_clock::now() + kCollectiveTimeout;
+    const auto deadline =
+        std::chrono::steady_clock::now() + distributed::kTpBootstrapWindow;
     for (;;) {
       struct addrinfo hints{};
       hints.ai_family = AF_INET;
@@ -440,17 +441,7 @@ private:
                        sizeof(no_delay));
     // After setup the socket only reports a dead peer; keepalive also
     // reports a host that vanished without closing it.
-    const int on = 1;
-    (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
-#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
-    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kKeepaliveIdleSeconds,
-                       sizeof(kKeepaliveIdleSeconds));
-    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
-                       &kKeepaliveIntervalSeconds,
-                       sizeof(kKeepaliveIntervalSeconds));
-    (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &kKeepaliveProbes,
-                       sizeof(kKeepaliveProbes));
-#endif
+    distributed::SetTpKeepalive(fd);
   }
 
   int fd_{-1};

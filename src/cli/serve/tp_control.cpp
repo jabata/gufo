@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "src/models/qwen38_flash_next/distributed/tp_keepalive.hpp"
+
 namespace gufo::server {
 namespace {
 
@@ -67,20 +69,8 @@ void SetStartupSocketOptions(int fd, std::chrono::milliseconds io_timeout) {
   (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
   const int enabled = 1;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
   (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
-#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
-  // Probe after one idle minute, then every ten seconds: a dead host is
-  // reported about two minutes after it stops answering.
-  const int idle_seconds = 60;
-  const int interval_seconds = 10;
-  const int probes = 6;
-  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds,
-                     sizeof(idle_seconds));
-  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds,
-                     sizeof(interval_seconds));
-  (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
-#endif
+  models::qwen38_flash_next::distributed::SetTpKeepalive(fd);
 }
 
 /// After the handshake a rank waits for the next command or response for as
