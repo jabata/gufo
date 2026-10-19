@@ -34,7 +34,7 @@ bool Pool(ContinuationPart part) {
          part == ContinuationPart::kDraftPooledKeys;
 }
 struct Metadata {
-  std::uint32_t version{2};
+  std::uint32_t version{kContinuationMetadataVersion};
   std::uint32_t target{}, draft{}, blocks{}, draft_blocks{}, hidden_base{};
   std::uint32_t residual_valid{}, image_bytes{};
   NgramHistory ngram;
@@ -212,23 +212,20 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
       layout_(model_ ? model_->config() : Config{},
               mode == core::SessionMode::kSpeculative, context,
               model_ ? model_->executor_->max_speculative() : 0),
-      identity_(std::move(identity)) {
+      identity_(ContinuationIdentity(
+          std::move(identity),
+          {.snapshot_version = Session::kSnapshotPayloadVersion,
+           .metadata_version = kContinuationMetadataVersion,
+           .context = context,
+           .mtp = mode == core::SessionMode::kSpeculative,
+           .max_speculative = model_ ? model_->executor_->max_speculative() : 0,
+           .prefill_capacity = model_ ? model_->PrefillCapacity() : 0,
+           .decode_concurrency = model_ ? model_->DecodeConcurrency() : 0})) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
-      identity_.empty() || context > model_->MaxContext() ||
+      context > model_->MaxContext() ||
       (mode == core::SessionMode::kSpeculative && !model_->HasMtp()))
     throw std::invalid_argument("invalid Flash-Next adapter configuration");
-  const auto put = [&](std::uint32_t value) {
-    for (unsigned i = 0; i < 4; ++i)
-      identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
-  };
-  put(2);  // Private components attest the target checkpoint boundary.
-  put(Session::kSnapshotPayloadVersion);
-  put(context);
-  put(mode == core::SessionMode::kSpeculative);
-  put(model_->executor_->max_speculative());
-  put(model_->PrefillCapacity());
-  put(model_->DecodeConcurrency());
   for (const auto& component : layout_.Components())
     descriptors_.push_back(component.descriptor);
 }
@@ -790,7 +787,8 @@ bool ContinuationAdapter::Validate(
   auto& session = *state.session;
   auto& native = *session.session_;
   auto policy = session.draft_length_;
-  if (metadata.version != 2 || metadata.hidden_base > metadata.target ||
+  if (metadata.version != kContinuationMetadataVersion ||
+      metadata.hidden_base > metadata.target ||
       metadata.target - metadata.hidden_base >
           model_->executor_->max_speculative() ||
       metadata.residual_valid > 1 ||

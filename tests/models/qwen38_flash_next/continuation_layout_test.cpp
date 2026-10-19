@@ -151,10 +151,46 @@ void CheckBacking(bool mtp, std::uint32_t context, std::uint32_t concurrency,
   Reject([&] { (void)layout.BackingPlan(ram, 0); });
   Reject([&] { (void)layout.BackingPlan(ram, 9); });
 }
+
+// A stored checkpoint is looked up only under an identical identity, so every
+// field that changes its meaning must change the identity.
+void CheckIdentity() {
+  const cache::Identity base{'q', 'f', 'n'};
+  const qfn::ContinuationIdentityFields fields{
+      .snapshot_version = 18,
+      .metadata_version = qfn::kContinuationMetadataVersion,
+      .context = 262144,
+      .mtp = true,
+      .max_speculative = 4,
+      .prefill_capacity = 8192,
+      .decode_concurrency = 8,
+  };
+  const auto identity = qfn::ContinuationIdentity(base, fields);
+  Require(std::equal(base.begin(), base.end(), identity.begin()),
+          "identity must extend the serving identity");
+  Require(identity == qfn::ContinuationIdentity(base, fields),
+          "identity must be deterministic");
+  const auto differs = [&](auto change, const char* message) {
+    auto other = fields;
+    change(other);
+    Require(qfn::ContinuationIdentity(base, other) != identity, message);
+  };
+  differs([](auto& f) { ++f.snapshot_version; }, "snapshot version ignored");
+  differs([](auto& f) { --f.metadata_version; }, "metadata version ignored");
+  differs([](auto& f) { f.context /= 2; }, "context ignored");
+  differs([](auto& f) { f.mtp = false; }, "draft mode ignored");
+  differs([](auto& f) { ++f.max_speculative; }, "draft length ignored");
+  differs([](auto& f) { ++f.prefill_capacity; }, "prefill capacity ignored");
+  differs([](auto& f) { ++f.decode_concurrency; }, "concurrency ignored");
+  Require(qfn::ContinuationIdentity({'o', 't', 'h'}, fields) != identity,
+          "serving identity ignored");
+  Reject([&] { (void)qfn::ContinuationIdentity({}, fields); });
+}
 }  // namespace
 
 int main() {
   try {
+    CheckIdentity();
     Check(false);
     Check(true);
     for (const auto mtp : {false, true}) {

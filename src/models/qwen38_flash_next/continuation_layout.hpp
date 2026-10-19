@@ -5,6 +5,7 @@
 #include <span>
 #include <vector>
 
+#include "src/cache/identity.hpp"
 #include "src/cache/types.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 
@@ -42,6 +43,21 @@ struct ContinuationComponent {
 // identity. Vision layout is rebuilt from the matching request attachment on
 // restoration.
 inline constexpr std::size_t kContinuationMetadataBytes = 160;
+// Version of that representation; bump it when its meaning changes. The
+// adapter identity carries it, so a stored record of another version is never
+// looked up instead of being read and rejected on restoration.
+inline constexpr std::uint32_t kContinuationMetadataVersion = 2;
+
+// Values besides the serving identity that a stored checkpoint depends on.
+struct ContinuationIdentityFields {
+  std::uint32_t snapshot_version{}, metadata_version{}, context{};
+  bool mtp{false};
+  std::uint32_t max_speculative{}, prefill_capacity{}, decode_concurrency{};
+};
+// The adapter's compatibility identity: `base`, which must not be empty,
+// followed by `fields`.
+[[nodiscard]] cache::Identity ContinuationIdentity(
+    cache::Identity base, const ContinuationIdentityFields& fields);
 
 struct ContinuationBackingClass {
   std::size_t block_bytes{}, blocks{}, metadata_bytes{};

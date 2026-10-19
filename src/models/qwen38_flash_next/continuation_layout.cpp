@@ -19,6 +19,25 @@ bool IsPool(ContinuationPart part) {
 }
 }  // namespace
 
+cache::Identity ContinuationIdentity(cache::Identity base,
+                                     const ContinuationIdentityFields& fields) {
+  if (base.empty())
+    throw std::invalid_argument("Flash-Next cache needs a serving identity");
+  const auto put = [&](std::uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i)
+      base.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+  };
+  put(2);  // Private components attest the target checkpoint boundary.
+  put(fields.snapshot_version);
+  put(fields.context);
+  put(fields.mtp);
+  put(fields.max_speculative);
+  put(fields.prefill_capacity);
+  put(fields.decode_concurrency);
+  put(fields.metadata_version);
+  return base;
+}
+
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
                                        std::uint32_t kept_rows)
