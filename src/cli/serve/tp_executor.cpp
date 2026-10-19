@@ -468,8 +468,12 @@ bool TpMirroredRunner::EndRequest(std::uint64_t sequence, std::string* error) {
   }
   const Request request = found->second;
   requests_.erase(found);
-  std::erase_if(leases_,
-                [&](const auto& lease) { return lease.second == sequence; });
+  std::erase_if(leases_, [&](const auto& lease) {
+    if (lease.second != sequence)
+      return false;
+    inherited_.erase(lease.first);
+    return true;
+  });
   if (!failure_.empty()) {
     SetError(error, "TP instruction channel failed: " + failure_);
     return false;
@@ -500,6 +504,25 @@ void TpMirroredRunner::Settle(std::uint64_t sequence, bool agreed) {
     }
   }
   settled_.notify_all();
+}
+
+void TpMirroredRunner::ForgetInherited(std::uint32_t state) const {
+  const auto inherited = inherited_.find(state);
+  if (inherited == inherited_.end())
+    return;
+  const auto lease = leases_.find(state);
+  // Work the request already did on the state may rest on the producer's.
+  const auto producer = producers_.find(state);
+  if (lease != leases_.end() &&
+      (producer == producers_.end() || producer->second != lease->second)) {
+    if (const auto found = dependencies_.find(lease->second);
+        found != dependencies_.end()) {
+      if (const auto entry = found->second.find(inherited->second);
+          entry != found->second.end())
+        found->second.erase(entry);
+    }
+  }
+  inherited_.erase(inherited);
 }
 
 bool TpMirroredRunner::AwaitDependencies(std::uint64_t sequence) const {
@@ -629,6 +652,9 @@ void TpMirroredRunner::SendInvalidate(std::uint32_t state) const noexcept {
     std::uint64_t sequence = 0;
     if (const auto lease = leases_.find(state); lease != leases_.end()) {
       sequence = lease->second;
+      // The request may have built on the earlier producer's work: a later
+      // restore keeps the dependency.
+      inherited_.erase(state);
       auto& request = requests_.at(sequence);
       DigestTpCall(request.digest, instruction);
       ++request.count;
@@ -744,16 +770,21 @@ void TpMirroredRunner::SetPromptContext(
     std::uint64_t sequence = 0;
     if (request == nullptr) {
       leases_.erase(mirrored.id());
+      inherited_.erase(mirrored.id());
     } else if (!requests_.contains(request->sequence)) {
       throw std::logic_error("TP request context names no open request");
     } else {
       sequence = request->sequence;
       leases_[mirrored.id()] = sequence;
-      // The state may hold what a request rank 1 has not judged yet.
+      inherited_.erase(mirrored.id());
+      // The state may hold what a request rank 1 has not judged yet, or
+      // rejected since the cache found it reusable.
       const auto producer = producers_.find(mirrored.id());
       if (producer != producers_.end() && producer->second != sequence &&
-          unsettled_.contains(producer->second)) {
+          (unsettled_.contains(producer->second) ||
+           rejected_.contains(producer->second))) {
         dependencies_[sequence].insert(producer->second);
+        inherited_[mirrored.id()] = producer->second;
       }
     }
     const TpInstruction instruction{.op = TpInstructionOp::kPromptContext,
@@ -1213,10 +1244,13 @@ void TpMirroredRunner::RestoreOrFork(TextRunnerState& state,
   auto& mirrored = Mirrored(state);
   {
     const std::lock_guard<std::mutex> lock(mutex_);
+    // The restore replaces the state's earlier work with the snapshot's.
+    ForgetInherited(mirrored.id());
     const auto lease = leases_.find(mirrored.id());
     if (lease != leases_.end() && handle->producer != 0 &&
         handle->producer != lease->second &&
-        unsettled_.contains(handle->producer)) {
+        (unsettled_.contains(handle->producer) ||
+         rejected_.contains(handle->producer))) {
       dependencies_[lease->second].insert(handle->producer);
     }
   }
@@ -1323,16 +1357,18 @@ void TpMirroredRunner::RestorePersistentSnapshot(
     throw std::invalid_argument("TP2 disk-cache payload names no file");
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
   auto& mirrored = Mirrored(state);
-  if (nonce == nonce_) {
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
     // Written by this process: as for a snapshot in memory, a rejected
     // producer makes the file a miss, and one without a verdict yet makes
     // the restoring request depend on it.
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (rejected_.contains(producer))
+    if (nonce == nonce_ && rejected_.contains(producer))
       throw std::runtime_error("TP snapshot of a request rank 1 rejected");
+    // The restore replaces the state's earlier work with the file's.
+    ForgetInherited(mirrored.id());
     const auto lease = leases_.find(mirrored.id());
-    if (lease != leases_.end() && producer != 0 && producer != lease->second &&
-        unsettled_.contains(producer)) {
+    if (nonce == nonce_ && lease != leases_.end() && producer != 0 &&
+        producer != lease->second && unsettled_.contains(producer)) {
       dependencies_[lease->second].insert(producer);
     }
   }

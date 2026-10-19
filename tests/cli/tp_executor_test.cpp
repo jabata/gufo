@@ -1291,6 +1291,82 @@ int main() {
     Require(unleased, "an ended request releases its state");
   }
 
+  // A verdict may arrive between the cache's reuse check and the lease: a
+  // request that continues a rejected producer's state or restores its
+  // snapshot fails. One whose restore replaced the work of a producer rank 1
+  // rejects later stands; one that built on that work first, even if it reset
+  // the state before the restore, does not.
+  {
+    auto toy = std::make_shared<ToyRunner>(ToyOptions{.cache = true});
+    auto runner = std::make_shared<TpMirroredRunner>(
+        toy, std::make_shared<CaptureSink>());
+    auto live = runner->CreateState();
+    auto restored = runner->CreateState();
+    auto replaced = runner->CreateState();
+    auto built = runner->CreateState();
+    auto reset = runner->CreateState();
+    auto source = runner->CreateState();
+    const std::vector<TextRunnerToken> prompt{4, 5, 6};
+    std::string error;
+    const auto produce = [&](std::uint64_t sequence, TextRunnerState& state) {
+      runner->BeginRequest(sequence);
+      runner->SetPromptContext(state,
+                               std::make_shared<TpRequestContext>(sequence));
+      (void)runner->Prefill(state, prompt, 0, 3);
+    };
+    produce(7, *live);
+    produce(8, *restored);
+    produce(9, *replaced);
+    produce(10, *source);
+    produce(14, *built);
+    produce(15, *reset);
+    const auto rejected_snapshot = runner->Snapshot(*live);
+    const auto agreed_snapshot = runner->Snapshot(*source);
+    for (const std::uint64_t sequence : {7, 8, 9, 10, 14, 15}) {
+      Require(runner->EndRequest(sequence, &error), error);
+    }
+    Require(runner->CanReuse(*live) && runner->CanReuse(*rejected_snapshot),
+            "released work is reusable before its verdict");
+    runner->Settle(7, false);
+    runner->Settle(8, true);
+    runner->Settle(10, true);
+
+    runner->BeginRequest(11);
+    runner->SetPromptContext(*live, std::make_shared<TpRequestContext>(11));
+    Require(!runner->AwaitDependencies(11),
+            "continuing a state rejected after the reuse check fails");
+    runner->BeginRequest(12);
+    runner->SetPromptContext(*restored, std::make_shared<TpRequestContext>(12));
+    runner->RestoreOrFork(*restored, *rejected_snapshot);
+    Require(!runner->AwaitDependencies(12),
+            "restoring a snapshot rejected after the reuse check fails");
+    runner->BeginRequest(13);
+    runner->SetPromptContext(*replaced, std::make_shared<TpRequestContext>(13));
+    runner->RestoreOrFork(*replaced, *agreed_snapshot);
+    runner->Settle(9, false);
+    Require(runner->AwaitDependencies(13),
+            "a restore drops the dependency on the work it replaced");
+    runner->BeginRequest(16);
+    runner->SetPromptContext(*built, std::make_shared<TpRequestContext>(16));
+    runner->Advance(*built, 7);
+    runner->RestoreOrFork(*built, *agreed_snapshot);
+    runner->BeginRequest(17);
+    runner->SetPromptContext(*reset, std::make_shared<TpRequestContext>(17));
+    runner->Advance(*reset, 7);
+    reset->Invalidate();
+    runner->RestoreOrFork(*reset, *agreed_snapshot);
+    runner->Settle(14, false);
+    runner->Settle(15, false);
+    Require(!runner->AwaitDependencies(16),
+            "a restore after the request's own calls keeps its dependency");
+    Require(!runner->AwaitDependencies(17),
+            "a restore after a reset of the request's own calls keeps its "
+            "dependency");
+    for (const std::uint64_t sequence : {11, 12, 13, 16, 17}) {
+      Require(runner->EndRequest(sequence, &error), error);
+    }
+  }
+
   // A batched multi-token decode is one instruction carrying each member's
   // budget and draw state and rank 0's draft plan.
   {

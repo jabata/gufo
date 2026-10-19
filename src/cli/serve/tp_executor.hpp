@@ -257,6 +257,10 @@ private:
   };
 
   void Drop(std::uint64_t id) const noexcept;
+  /// Drops the dependency `state`'s lease took on its earlier producer, whose
+  /// work a restore replaces, unless the request already changed or reset the
+  /// state. Requires `mutex_`.
+  void ForgetInherited(std::uint32_t state) const;
   /// Whether rank 1 can mirror the multi-token cycles of the request `state`
   /// is leased to: always without a constraint, else when rank 1 rebuilt it.
   [[nodiscard]] bool CyclesMirrored(
@@ -306,9 +310,15 @@ private:
   /// Requests rank 1 has not judged yet, and those it disagreed with.
   mutable std::unordered_set<std::uint64_t> unsettled_;
   mutable std::unordered_set<std::uint64_t> rejected_;
-  /// Request to the unjudged requests whose live state it reused.
-  mutable std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>>
+  /// Request to the requests whose state or snapshot it reused while they were
+  /// unjudged or rejected; one entry per reuse.
+  mutable std::unordered_map<std::uint64_t,
+                             std::unordered_multiset<std::uint64_t>>
       dependencies_;
+  /// Leased state id to the earlier producer its lease depends on, until a
+  /// restore replaces that producer's work or a reset ends the lease's chance
+  /// to drop it.
+  mutable std::unordered_map<std::uint32_t, std::uint64_t> inherited_;
   mutable std::condition_variable settled_;
   mutable std::string failure_;
   /// Names this process in the disk-cache files it writes, so a restore in the
