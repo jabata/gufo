@@ -1511,6 +1511,25 @@ int main() {
         what + ": the second request follows it: " + second_end.worker_error);
   }
 
+  // Probe, not for merge: a request that reused another one's state waits
+  // for that request's end on rank 1, which follows its consumer's drain. A
+  // producer that ends 62 s later makes the dependent fail as rejected
+  // although rank 1 agreed with both.
+  {
+    Pair pair({.cache = true}, {.cache = true});
+    auto first = pair.RunOpen(prompt, 6, {}, {}, {}, true);
+    auto second = pair.RunOpen(prompt, 6, {}, {}, {}, true);
+    auto later = std::async(std::launch::async,
+                            [&] { return pair.Close(std::move(second)); });
+    std::this_thread::sleep_for(std::chrono::seconds(62));
+    const auto first_end = pair.Close(std::move(first));
+    const auto second_end = later.get();
+    Require(first_end.worker_error.empty(),
+            "slow producer: rank 1 agrees with the producer");
+    Require(second_end.worker_error.empty(),
+            "slow producer: the dependent stands: " + second_end.worker_error);
+  }
+
   // Concurrent requests: each call names its request, concurrent decoders run
   // in one batched instruction, greedy MTP ones with rank 0's draft plan
   // (rank 1 would choose another), and every request produces what it
