@@ -1679,6 +1679,17 @@ int RunServe(std::span<const char* const> args) {
                   << '\n';
         return 1;
       }
+      // The ranks pair before each loads its model. A peer that exits during
+      // the load restarts into a new pairing this rank would join only after
+      // its own load failed at the handshake; exit now so the supervisor
+      // restarts this rank into the peer's next bootstrap window.
+      tp_control->WatchPeerUntilHandshake([](const std::string& reason) {
+        server::Logger::Error(
+            "tp", "event=tp_peer_lost phase=load action=exit reason=" + reason);
+        std::cerr.flush();
+        std::fflush(nullptr);
+        std::_Exit(1);
+      });
 #else
       std::cerr << "Error: this build has no TP2 RDMA support\n";
       return 2;
@@ -1794,9 +1805,13 @@ int RunServe(std::span<const char* const> args) {
     if (tp_world_size == 2 && tp_rank == 1) {
       std::string worker_error;
       if (!backend->run_worker(&worker_error)) {
+        // As rank 0 does on a lost pair, skip teardown: it could wait on an
+        // exchange the peer never ends.
         server::Logger::Error("server",
                               "event=tp_worker_failed reason=" + worker_error);
-        return 1;
+        std::cerr.flush();
+        std::fflush(nullptr);
+        std::_Exit(1);
       }
       return 0;
     }

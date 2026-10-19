@@ -6,11 +6,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -966,6 +968,97 @@ int main() {
   }
   Require(idle_broker.Failure().find("receive failed") != std::string::npos,
           "an idle TP broker reports a lost peer: " + idle_broker.Failure());
+
+  // The ranks pair, then each loads its model for about a minute before the
+  // handshake. A peer that sends its hello first is not a lost peer: the hello
+  // stays queued for the handshake.
+  const auto load_port = FreePort();
+  std::shared_ptr<TpControlChannel> loading_worker;
+  std::thread load_connector([&] {
+    loading_worker =
+        TpControlChannel::Connect("127.0.0.1", load_port, &client_error);
+  });
+  auto loaded_server = TpControlChannel::Listen(load_port, &server_error);
+  load_connector.join();
+  Require(loaded_server != nullptr && loading_worker != nullptr,
+          "TP loading pair connects");
+  std::atomic<bool> worker_saw_loss{false};
+  loading_worker->WatchPeerUntilHandshake(
+      [&](const std::string&) { worker_saw_loss.store(true); });
+  bool loaded_server_handshake = false;
+  std::thread loaded_server_thread([&] {
+    loaded_server_handshake = loaded_server->Handshake(rank0, &server_error);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  Require(!worker_saw_loss.load(),
+          "a peer hello during the load is not a lost peer");
+  Require(loading_worker->Handshake(rank1, &client_error), client_error);
+  loaded_server_thread.join();
+  Require(loaded_server_handshake && !worker_saw_loss.load(),
+          "TP pair handshakes after a watched load");
+
+  // Rank 0 exiting while rank 1 loads is reported at once, not after the
+  // load at the handshake, so rank 1 can restart into rank 0's next pairing.
+  const auto lost_port = FreePort();
+  std::shared_ptr<TpControlChannel> orphan_worker;
+  std::thread lost_connector([&] {
+    orphan_worker =
+        TpControlChannel::Connect("127.0.0.1", lost_port, &client_error);
+  });
+  auto exiting_server = TpControlChannel::Listen(lost_port, &server_error);
+  lost_connector.join();
+  Require(exiting_server != nullptr && orphan_worker != nullptr,
+          "TP orphan pair connects");
+  std::mutex loss_mutex;
+  std::string loss_reason;
+  std::atomic<int> loss_reports{0};
+  orphan_worker->WatchPeerUntilHandshake([&](std::string reason) {
+    const std::lock_guard<std::mutex> lock(loss_mutex);
+    loss_reason = std::move(reason);
+    loss_reports.fetch_add(1);
+  });
+  exiting_server.reset();
+  const auto orphan_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (loss_reports.load() == 0 &&
+         std::chrono::steady_clock::now() < orphan_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  {
+    const std::lock_guard<std::mutex> lock(loss_mutex);
+    Require(loss_reports.load() == 1 &&
+                loss_reason.find("closed the channel before the handshake") !=
+                    std::string::npos,
+            "a peer lost during the load is reported once: " + loss_reason);
+  }
+  orphan_worker.reset();
+
+  // A watch the handshake already ended stays silent when the pair ends.
+  const auto ended_port = FreePort();
+  std::shared_ptr<TpControlChannel> ended_worker;
+  std::thread ended_connector([&] {
+    ended_worker =
+        TpControlChannel::Connect("127.0.0.1", ended_port, &client_error);
+  });
+  auto ended_server = TpControlChannel::Listen(ended_port, &server_error);
+  ended_connector.join();
+  Require(ended_server != nullptr && ended_worker != nullptr,
+          "TP ended pair connects");
+  std::atomic<bool> ended_saw_loss{false};
+  ended_worker->WatchPeerUntilHandshake(
+      [&](const std::string&) { ended_saw_loss.store(true); });
+  bool ended_server_handshake = false;
+  std::thread ended_server_thread([&] {
+    ended_server_handshake = ended_server->Handshake(rank0, &server_error);
+  });
+  Require(ended_worker->Handshake(rank1, &client_error), client_error);
+  ended_server_thread.join();
+  Require(ended_server_handshake, server_error);
+  ended_server.reset();
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  Require(!ended_saw_loss.load(),
+          "the handshake ends the watch; later losses go to the worker loop");
 
   Require(server->port() == port && client->port() == port,
           "TP control service port");

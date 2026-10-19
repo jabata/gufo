@@ -558,11 +558,66 @@ std::shared_ptr<TpControlChannel> TpControlChannel::Connect(
 }
 
 TpControlChannel::~TpControlChannel() {
+  StopPeerWatch();
   interrupted_.store(true, std::memory_order_release);
   if (fd_ >= 0) {
     ::shutdown(fd_, SHUT_RDWR);
     ::close(fd_);
     fd_ = -1;
+  }
+}
+
+void TpControlChannel::WatchPeerUntilHandshake(
+    std::function<void(std::string)> on_lost) {
+  if (peer_watch_.joinable() || handshaken_ || fd_ < 0) {
+    return;
+  }
+  stop_peer_watch_.store(false, std::memory_order_release);
+  peer_watch_ = std::thread([this, on_lost = std::move(on_lost)] {
+    constexpr int kPollMilliseconds = 100;
+    while (!stop_peer_watch_.load(std::memory_order_acquire)) {
+      // Only a hang-up or error ends the watch: the peer's hello may arrive
+      // while this rank still loads, and stays queued for the handshake.
+      pollfd descriptor{.fd = fd_, .events = POLLRDHUP, .revents = 0};
+      const int result = ::poll(&descriptor, 1, kPollMilliseconds);
+      if (result < 0 && errno == EINTR) {
+        continue;
+      }
+      if (result < 0) {
+        on_lost(SystemError("TP control poll"));
+        return;
+      }
+      if ((descriptor.revents & POLLERR) != 0) {
+        int socket_error = 0;
+        socklen_t size = sizeof(socket_error);
+        (void)::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &socket_error, &size);
+        on_lost(std::string("TP control connection failed before the "
+                            "handshake: ") +
+                std::strerror(socket_error));
+        return;
+      }
+      if ((descriptor.revents & (POLLRDHUP | POLLHUP)) != 0) {
+        on_lost("TP control peer closed the channel before the handshake");
+        return;
+      }
+      if (result > 0) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kPollMilliseconds));
+      }
+    }
+  });
+}
+
+void TpControlChannel::StopPeerWatch() noexcept {
+  stop_peer_watch_.store(true, std::memory_order_release);
+  if (!peer_watch_.joinable()) {
+    return;
+  }
+  // `on_lost` may release the last owner of this channel from the watch.
+  if (peer_watch_.get_id() == std::this_thread::get_id()) {
+    peer_watch_.detach();
+  } else {
+    peer_watch_.join();
   }
 }
 
@@ -686,6 +741,8 @@ bool TpControlChannel::ReceiveFrame(std::uint16_t type, std::uint64_t* sequence,
 
 bool TpControlChannel::Handshake(const TpControlConfig& config,
                                  std::string* error) {
+  // The handshake reports a lost peer itself, with the reason.
+  StopPeerWatch();
   if (config.world_size != 2 || config.rank != rank_ || config.rank > 1 ||
       config.max_context == 0 || config.prefill_chunk_tokens == 0 ||
       config.sessions == 0 || config.auth_token.empty() ||
