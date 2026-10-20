@@ -543,6 +543,12 @@ bool TpControlChannel::SendAll(const void* data, std::size_t bytes,
       continue;
     }
     SetError(error, SystemError("TP control send"));
+    // A frame cut off midway, as when the send timeout expires, leaves the
+    // peer reading the next frame as this one's payload. End the channel so
+    // every later send and receive fails instead.
+    if (sent > 0) {
+      Interrupt();
+    }
     return false;
   }
   return true;

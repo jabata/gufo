@@ -887,6 +887,47 @@ int main() {
   Require(idle_broker.Failure().find("receive failed") != std::string::npos,
           "an idle TP broker reports a lost peer: " + idle_broker.Failure());
 
+  // A send that times out after part of a frame went out leaves the peer
+  // unable to find the next frame, so the channel must refuse later sends
+  // rather than append a new frame to the cut-off one.
+  const auto stalled_port = FreePort();
+  std::shared_ptr<TpControlChannel> stalled_client;
+  std::thread stalled_connector([&] {
+    stalled_client = TpControlChannel::Connect("127.0.0.1", stalled_port,
+                                               &client_error, kShortIoTimeout);
+  });
+  auto stalled_server =
+      TpControlChannel::Listen(stalled_port, &server_error, kShortIoTimeout);
+  stalled_connector.join();
+  Require(stalled_server != nullptr && stalled_client != nullptr,
+          "TP stalled pair connects");
+  bool stalled_server_handshake = false;
+  bool stalled_client_handshake = false;
+  std::thread stalled_server_thread([&] {
+    stalled_server_handshake = stalled_server->Handshake(rank0, &server_error);
+  });
+  std::thread stalled_client_thread([&] {
+    stalled_client_handshake = stalled_client->Handshake(rank1, &client_error);
+  });
+  stalled_server_thread.join();
+  stalled_client_thread.join();
+  Require(stalled_server_handshake && stalled_client_handshake,
+          "TP stalled pair handshakes");
+  // Larger than the loopback socket buffers, and rank 1 does not read.
+  TpControlCommand oversized = command;
+  oversized.prompt_context.assign(std::size_t{64} << 20, 0x5a);
+  std::string stalled_error;
+  Require(!stalled_server->SendCommand(oversized, &stalled_error) &&
+              !stalled_error.empty(),
+          "TP send to a peer that stopped reading times out");
+  stalled_error.clear();
+  Require(!stalled_server->SendCommand(command, &stalled_error) &&
+              stalled_error.find("interrupted") != std::string::npos,
+          "TP channel refuses a frame after a cut-off one: " + stalled_error);
+  TpControlCommand stalled_received;
+  Require(!stalled_client->ReceiveCommand(&stalled_received, &stalled_error),
+          "TP peer does not parse a cut-off frame");
+
   Require(server->port() == port && client->port() == port,
           "TP control service port");
 
