@@ -285,6 +285,18 @@ void CheckBatchProfitability() {
   Require(policy.Choose(rows, 0) <= 1, "invalid timing corrupted policy");
 }
 
+void CheckBatchPlannable() {
+  Require(qfn::BatchPlannable({}), "greedy request lost the batch width");
+  Require(qfn::BatchPlannable({.temperature = 0.0F, .seed = 7}),
+          "seeded greedy request lost the batch width");
+  Require(qfn::BatchPlannable({.temperature = 1.0F, .top_k = 20}),
+          "unseeded sampled request lost the batch width");
+  Require(!qfn::BatchPlannable({.temperature = 1.0F, .top_k = 20, .seed = 0}),
+          "seeded sampled request took a peer-dependent width");
+  Require(qfn::BatchPlannable({.temperature = 1.0F, .top_k = 1, .seed = 3}),
+          "top-1 request was treated as random sampling");
+}
+
 void CheckSampledOutputFrequencies() {
   const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
   qfn::MtpCandidateLogits candidates;
@@ -392,6 +404,7 @@ int main() {
     CheckLengthController();
     CheckCalibratedCosts();
     CheckBatchProfitability();
+    CheckBatchPlannable();
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     CheckPointMassFrequencies();

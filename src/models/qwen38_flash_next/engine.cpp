@@ -1421,7 +1421,7 @@ std::optional<std::uint32_t> Session::PlanBatch(
     if (r.session == nullptr || r.sampler == nullptr || !r.session->valid_ ||
         r.session->tokens_.empty() || r.max_tokens == 0)
       continue;
-    if (!r.session->MtpEnabled() || r.sampler->config().uses_random_sampling())
+    if (!r.session->MtpEnabled() || !BatchPlannable(r.sampler->config()))
       return std::nullopt;
     const auto& exec = *r.session->model_->executor_;
     const auto cap = std::min<std::size_t>(

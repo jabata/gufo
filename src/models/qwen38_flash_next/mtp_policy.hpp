@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 
+#include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/mtp_costs.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -160,10 +161,18 @@ private:
   MtpLengthState state_{};
 };
 
+// A batch-wide draft count depends on the batch's peers. Seeded sampled
+// requests keep their per-session policy so they replay one at a time; greedy
+// and unseeded sampled requests share the batch's measured width.
+[[nodiscard]] inline bool BatchPlannable(
+    const sampling::SamplingConfig& config) noexcept {
+  return !config.uses_random_sampling() || config.seed < 0;
+}
+
 // Runtime costs belong to a physical batch, not an individual sequence.
 // Separate occupancy/context bins avoid applying shallow C1 timings to C8.
-// Greedy output is independent of the chosen width; sampled requests keep
-// the deterministic per-session policy to preserve seeded replay.
+// Greedy output is independent of the chosen width; seeded sampled requests
+// keep the deterministic per-session policy to preserve seeded replay.
 class MtpBatchController {
 public:
   struct Row {
