@@ -918,6 +918,28 @@ gufo::sampling::SamplingConfig Sampled() {
 
 int main() {
   {
+    // The request context TP2 hands the cache keeps the image boundaries, so
+    // a checkpoint taken before an appended image keeps its identity.
+    auto images = std::make_shared<gufo::server::TextPromptContext>();
+    images->cache_identity = {1, 2, 3};
+    images->cache_prefixes.push_back({40, {}});
+    images->cache_prefixes.push_back({90, {7, 7}});
+    const TpRequestContext request(11, images);
+    Require(request.cache_identity == images->cache_identity,
+            "TP2 request context keeps the complete image identity");
+    Require(request.cache_prefixes.size() == 2 &&
+                request.cache_prefixes[1].token_count == 90 &&
+                request.cache_prefixes[1].identity ==
+                    std::vector<std::uint8_t>{7, 7},
+            "TP2 request context keeps the per-image cache boundaries");
+    Require(request.CacheIdentity(32).empty() &&
+                std::ranges::equal(request.CacheIdentity(64),
+                                   std::vector<std::uint8_t>{7, 7}) &&
+                std::ranges::equal(request.CacheIdentity(128),
+                                   std::vector<std::uint8_t>{1, 2, 3}),
+            "TP2 request context resolves prefix identities per boundary");
+  }
+  {
     auto toy = std::make_shared<ToyRunner>(ToyOptions{});
     const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());
     using Status = TextModelRunner::DeviceProbeStatus;

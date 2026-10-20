@@ -107,6 +107,9 @@ struct TpRequestContext final : TextPromptContext {
       : sequence(sequence), images(std::move(images)) {
     if (this->images != nullptr) {
       cache_identity = this->images->cache_identity;
+      // The per-image boundaries let a checkpoint taken before a new image
+      // keep its identity; without them every appended image misses the cache.
+      cache_prefixes = this->images->cache_prefixes;
     }
   }
   std::uint64_t sequence;
