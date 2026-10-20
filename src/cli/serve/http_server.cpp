@@ -703,9 +703,11 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (!value->is_bool() || value->as_bool())
       return InvalidCompatibilityRequest("'" + field + "' must be false");
   }
+  // OpenAI clients send null for options they leave unset (LangChain's
+  // legacy completions client sends "logprobs": null), so null means absent.
   for (const std::string field : {"n", "best_of"}) {
     if (const auto* value = body.find(field);
-        value != nullptr &&
+        value != nullptr && !value->is_null() &&
         (!value->is_number() || value->as_double() != 1.0)) {
       return InvalidCompatibilityRequest("only '" + field + "=1' is supported");
     }
@@ -739,7 +741,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
-        body.contains(field) &&
+        body.contains(field) && !body.find(field)->is_null() &&
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
@@ -880,7 +882,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
-  if (const auto* options = body.find("stream_options")) {
+  if (const auto* options = body.find("stream_options");
+      options != nullptr && !options->is_null()) {
     if (!stream || !options->is_object())
       return InvalidCompatibilityRequest(
           "'stream_options' requires streaming and must be an object");
@@ -917,6 +920,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
     return InvalidCompatibilityRequest(*error);
 
   const auto* input = body.find("prompt");
+  // A one-string array is still a single prompt; LangChain sends this form.
+  if (input != nullptr && input->is_array() && input->size() == 1)
+    input = &input->items().front();
   if (input == nullptr || !input->is_string()) {
     return InvalidCompatibilityRequest("'prompt' must be a single string");
   }

@@ -1228,9 +1228,20 @@ void TestCompatibilityRequests() {
       response_body(buffered);
     }
   }
+  // LangChain's legacy OpenAI client sends a one-string prompt array and null
+  // for the options it leaves unset.
+  response_body(server.Post(
+      "/v1/completions",
+      R"({"prompt":["langchain"],"frequency_penalty":0,"logprobs":null,"max_tokens":4,"n":1,"presence_penalty":0,"seed":null,"temperature":0.7,"top_p":1})"));
+  assert(server.backend->LastCall().prompt == "langchain");
+  response_body(server.Post(
+      "/v1/completions",
+      R"({"prompt":"hi","n":null,"best_of":null,"suffix":null,"stream_options":null})"));
   const int calls = server.backend->calls;
   ExpectStatus(server.Post("/v1/completions", R"({"prompt":["one","two"]})"),
                400);
+  ExpectStatus(server.Post("/v1/completions", R"({"prompt":[1]})"), 400);
+  ExpectStatus(server.Post("/v1/completions", R"({"prompt":[]})"), 400);
   ExpectStatus(server.Post("/v1/responses",
                            R"({"input":[{"role":"assistant","content":[
                            {"type":"input_text","text":"describe"},
