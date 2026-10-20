@@ -173,7 +173,11 @@ work can batch across ready requests. See the
 [Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
-between active decode rounds without changing a lone request's kernel policy.
+between active decode rounds without changing a lone request's kernel policy. `--prefill-decode-rounds` sets how many decode rounds every
+running request gets after each of those chunks (default 1). With one round a
+running generation is nearly idle while another prompt is processed; more
+rounds keep it flowing at the cost of the new prompt, since both share the
+GPU. The longest pause a running generation sees is one chunk.
 
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
