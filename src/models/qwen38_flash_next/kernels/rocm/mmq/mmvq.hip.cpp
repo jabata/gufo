@@ -248,9 +248,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-template<ggml_type type, int c_rows_per_block, bool gated = false>
-__launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
-                  1) static __global__
+template<ggml_type type, int c_rows_per_block, bool gated = false,
+         int max_tokens = mmvq_moe_max_batch(type)>
+__launch_bounds__(max_tokens * (gated ? 64 : 32), 1) static __global__
     void mul_mat_vec_q_moe(const void* __restrict__ weights,
                            const void* __restrict__ vy,
                            const int32_t* __restrict__ ids,
@@ -789,7 +789,9 @@ static void launch_moe(const void* weights, const block_q8_1* input,
 
 // A dense matrix is the routed kernel's single expert: every token reads
 // expert 0 through one zero ID (ids_stride 0), so each token keeps the same
-// per-row dot-product order as a routed slot at any batch width.
+// per-row dot-product order as a routed slot at any batch width. All tokens
+// share the weights, so one block takes up to MMVQ_MAX_BATCH_SIZE of them
+// (one weight pass for a whole verification batch).
 template<ggml_type type>
 static void launch_dense(const void* weights, const block_q8_1* input,
                          const int32_t* zero_id, float* output, int k,
@@ -797,9 +799,9 @@ static void launch_dense(const void* weights, const block_q8_1* input,
                          hipStream_t stream) {
   GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && tokens > 0);
   constexpr int rows_per_wave = 2;
-  const int block_tokens = std::min(tokens, mmvq_moe_max_batch(type));
+  const int block_tokens = std::min(tokens, MMVQ_MAX_BATCH_SIZE);
   const int row_stride = k / ggml_blck_size(type);
-  mul_mat_vec_q_moe<type, rows_per_wave>
+  mul_mat_vec_q_moe<type, rows_per_wave, false, MMVQ_MAX_BATCH_SIZE>
       <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, 1,
               (tokens + block_tokens - 1) / block_tokens),
          dim3(32, block_tokens), 0, stream>>>(
