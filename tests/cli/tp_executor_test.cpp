@@ -33,6 +33,7 @@
 #include <tuple>
 #include <vector>
 
+#include "src/cli/serve/prompt_logprobs.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/tp_control.hpp"
 
@@ -153,6 +154,8 @@ public:
   void SetCancellationCheck(const CancellationCheck&) override;
 
   std::vector<TextRunnerToken> tokens;
+  /// The frontier's logits, kept while a scoring request reads them.
+  std::vector<float> frontier;
   /// The bound context's shade, zero without one.
   std::uint8_t shade{0};
   std::size_t id() const { return id_; }
@@ -377,6 +380,11 @@ public:
       return {.stop = true};
     }
     return {.stop = false, .token = token, .piece = Piece(token)};
+  }
+  std::span<const float> FrontierLogits(TextRunnerState& state) const override {
+    auto& toy = Toy(state);
+    toy.frontier = Logits(toy.tokens, toy.shade);
+    return toy.frontier;
   }
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     auto& toy = Toy(state);
@@ -614,10 +622,12 @@ public:
       TextGenerationScheduler::CancellationCheck is_cancelled = {},
       bool reuse = false, std::size_t prefix = 0,
       const std::function<void()>& submitted = {},
-      std::shared_ptr<const gufo::server::TextPromptContext> images = {}) {
+      std::shared_ptr<const gufo::server::TextPromptContext> images = {},
+      std::optional<gufo::server::TextScoring> scoring = std::nullopt) {
     return Close(RunOpen(std::move(prompt), max_tokens, std::move(sampling),
                          std::move(stop_sequences), std::move(is_cancelled),
-                         reuse, prefix, submitted, std::move(images)));
+                         reuse, prefix, submitted, std::move(images),
+                         std::move(scoring)));
   }
 
   /// Runs a request on rank 0 without ending it, as when the next request
@@ -629,7 +639,8 @@ public:
       TextGenerationScheduler::CancellationCheck is_cancelled = {},
       bool reuse = false, std::size_t prefix = 0,
       const std::function<void()>& submitted = {},
-      std::shared_ptr<const gufo::server::TextPromptContext> images = {}) {
+      std::shared_ptr<const gufo::server::TextPromptContext> images = {},
+      std::optional<gufo::server::TextScoring> scoring = std::nullopt) {
     const auto sequence = next_sequence_.fetch_add(1);
     TpControlCommand begin{.sequence = sequence,
                            .max_tokens = static_cast<std::uint32_t>(max_tokens),
@@ -652,6 +663,7 @@ public:
     metadata.cache_prompt = reuse;
     metadata.cache_prefix_tokens = prefix;
     metadata.stop_sequences = std::move(stop_sequences);
+    metadata.scoring = std::move(scoring);
     auto request = scheduler_->Submit(std::move(prompt), max_tokens, sampling,
                                       is_cancelled, reuse, std::move(metadata));
     if (submitted) {
@@ -930,6 +942,47 @@ int main() {
     }
   }
   const std::vector<TextRunnerToken> prompt{5, 9, 13, 17, 21, 3, 8};
+
+  // Teacher-forced scoring stays in lockstep: rank 0 reads its own logits,
+  // and rank 1 advances the same forced tokens. A scoring request is not
+  // greedy, so rank 1 does not expect the history to be its argmax.
+  {
+    const std::vector<TextRunnerToken> forced{1, 2, 3, 4, 5, 6};
+    gufo::sampling::SamplingConfig scoring_sampling;
+    scoring_sampling.temperature = 1.0F;
+    Pair pair({}, {});
+    const auto scored =
+        pair.Run(prompt, forced.size(), scoring_sampling, {}, {}, false, 0, {},
+                 {}, gufo::server::TextScoring{.tokens = forced, .top_k = 3});
+    Require(scored.worker_error.empty(),
+            "TP2 scoring is agreed: " + scored.worker_error);
+    Require(scored.result.prompt_logprobs.size() == forced.size(),
+            "TP2 scoring reports every position");
+    pair.RequireSameCalls("TP2 scoring");
+    ToyRunner reference({});
+    auto state = reference.CreateState();
+    auto& toy = dynamic_cast<ToyState&>(*state);
+    toy.tokens = prompt;
+    for (std::size_t i = 0; i < forced.size(); ++i) {
+      const auto expected = gufo::server::ScorePromptToken(
+          reference.FrontierLogits(toy), forced[i], 3);
+      const auto& actual = scored.result.prompt_logprobs[i];
+      Require(actual.token == forced[i] && actual.logprob == expected.logprob &&
+                  actual.rank == expected.rank && actual.top.size() == 3 &&
+                  actual.top[0].token == expected.top[0].token,
+              "TP2 position " + std::to_string(i) +
+                  " is scored from exactly its history");
+      toy.tokens.push_back(forced[i]);
+    }
+    // The same history forced under greedy sampling is what rank 1's argmax
+    // check exists to catch, which is why scoring is never greedy.
+    Pair greedy_pair({}, {});
+    const auto greedy = greedy_pair.Run(
+        prompt, forced.size(), {}, {}, {}, false, 0, {}, {},
+        gufo::server::TextScoring{.tokens = forced, .top_k = 3});
+    Require(!greedy.worker_error.empty(),
+            "a greedy forced history is flagged by rank 1");
+  }
 
   // TP2 keeps up with one host: the wrapper reports every capability of the
   // runner it wraps, apart from the listed gaps.

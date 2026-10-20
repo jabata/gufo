@@ -212,6 +212,9 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void Advance(TextRunnerState& state, TextRunnerToken token) const override;
+  /// Local, like selection: rank 0 reads its own logits.
+  [[nodiscard]] std::span<const float> FrontierLogits(
+      TextRunnerState& state) const override;
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override;

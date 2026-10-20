@@ -896,6 +896,11 @@ TextDecodeSelection TpMirroredRunner::SelectNext(
   return inner_->SelectNext(Mirrored(state).inner(), sampler);
 }
 
+std::span<const float> TpMirroredRunner::FrontierLogits(
+    TextRunnerState& state) const {
+  return inner_->FrontierLogits(Mirrored(state).inner());
+}
+
 void TpMirroredRunner::Advance(TextRunnerState& state,
                                TextRunnerToken token) const {
   const std::lock_guard<std::recursive_mutex> call_lock(call_mutex_);
