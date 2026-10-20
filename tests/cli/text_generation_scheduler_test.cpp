@@ -1362,6 +1362,48 @@ void TestDecodeActivePrefillIsBounded(bool multi_token, bool batched) {
          "chunk metrics capture the selected active-decode policy");
 }
 
+void TestPrefillDecodeRoundsPerChunk(std::size_t rounds) {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(
+      control, 2,
+      {.decode_active_tokens = 2, .decode_rounds_per_chunk = rounds});
+  auto request_a = scheduler->Submit({1}, 40, 0.0F);
+  control->WaitForAdvance(1);
+  auto request_b = scheduler->Submit({2, 20, 21, 22, 23, 24, 25}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  Expect(request_a.Wait().tokens == ExpectedTokens(1, 40),
+         "extra decode rounds preserve the decoder trajectory");
+  Expect(request_b.Wait().tokens == ExpectedTokens(2, 2),
+         "extra decode rounds preserve the chunked prompt trajectory");
+
+  const auto events = control->Events();
+  std::size_t previous_b_prefill = events.size();
+  std::size_t b_prefill_chunks = 0;
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].kind != EventKind::kPrefill || events[index].label != 2) {
+      continue;
+    }
+    if (previous_b_prefill != events.size()) {
+      std::size_t a_advances = 0;
+      for (std::size_t between = previous_b_prefill + 1; between < index;
+           ++between) {
+        if (events[between].kind == EventKind::kAdvance &&
+            events[between].label == 1) {
+          ++a_advances;
+        }
+      }
+      Expect(a_advances == rounds,
+             "every prompt chunk is followed by the configured decode rounds");
+    }
+    previous_b_prefill = index;
+    ++b_prefill_chunks;
+  }
+  Expect(b_prefill_chunks == 4,
+         "extra decode rounds keep the prompt chunk bound");
+}
+
 void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   auto control = std::make_shared<FakeControl>();
   control->multi_token_decode = multi_token;
@@ -3107,6 +3149,8 @@ int main() {
       TestPrefillYieldsToEveryDueDecoder(multi_token, batched);
     }
   }
+  TestPrefillDecodeRoundsPerChunk(1);
+  TestPrefillDecodeRoundsPerChunk(3);
   TestNonIncrementalRunnerFallsBackSafely();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();
