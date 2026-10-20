@@ -9,6 +9,7 @@
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/qwen38_flash_next/dense_formats.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -102,7 +103,9 @@ struct Uploader {
     if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
-    if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
+    // Dense K-quant projections read the same Q8_1 activation rows.
+    if ((t.type == core::GgmlType::kQ8_0 || IsDenseKQuant(t.type)) &&
+        t.experts == 1) {
       max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
     }
     return d;
@@ -155,8 +158,8 @@ struct Uploader {
   /// Uploads matrices of one type stacked along rows; every input shares
   /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
-  /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV.
+  /// tier runs at speed. A Q8_0 or K-quant stack merges projections of one
+  /// input into a single decode GEMV.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -167,8 +170,8 @@ struct Uploader {
     const core::GgmlType type = (*parts.begin())->type;
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+          (type != core::GgmlType::kF32 && !IsStackableDense(type))) {
+        Fail("stacked upload needs F32, Q8_0 or K-quant tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -192,7 +195,7 @@ struct Uploader {
         offset += t->SizeBytes();
       }
     }
-    if (type == core::GgmlType::kQ8_0) {
+    if (IsStackableDense(type)) {
       if (Measuring()) {
         return d;
       }
@@ -239,11 +242,12 @@ struct Uploader {
     d.linear = l.linear;
     d.hc_attn = Mixer(l.hc_attn);
     d.hc_ffn = Mixer(l.hc_ffn);
-    // Projections of one input are stacked into one Q8_0 GEMV where the
-    // quantization allows; otherwise they stay separate.
+    // Projections of one input are stacked into one GEMV where they share a
+    // stackable format; otherwise they stay separate.
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+        if (t->empty() || !IsStackableDense(t->type) ||
+            t->type != (*parts.begin())->type ||
             t->cols != (*parts.begin())->cols) {
           return false;
         }
@@ -357,20 +361,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
-  const auto supported = [&](const TensorRef& t) {
-    if (t.type != core::GgmlType::kQ6_K)
+  // The CPU reference also reads Q6_K experts, and the embedding lookup
+  // reads none of the sub-8-bit block formats; dense projections (output
+  // head included) take Q4_K, Q5_K, Q6_K and Q5_1. Reject the rest before
+  // allocating device weights.
+  const auto supported = [&](const TensorRef& t, bool k_quant) {
+    if (t.type != core::GgmlType::kQ6_K && (k_quant || !IsDenseKQuant(t.type)))
       return true;
     if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
+      *error_msg = "unsupported HIP tensor format " +
+                   std::string(core::ToString(t.type)) + ": " +
+                   std::string(t.name);
     return false;
   };
   const auto layer_supported = [&](const LayerWeights& l) {
-    return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
-           supported(l.ffn_down_exps);
+    return supported(l.ffn_gate_exps, true) && supported(l.ffn_up_exps, true) &&
+           supported(l.ffn_down_exps, true);
   };
-  if (!supported(w.token_embd) || !supported(w.output) ||
+  if (!supported(w.token_embd, false) ||
       !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;

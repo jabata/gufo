@@ -722,6 +722,75 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                           out_f32, K, M, N, input_stride, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+static bool dense_kquant(ggml_type type) {
+  return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+         type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_1;
+}
+
+extern "C" int qfn_mmq_kquant_dense_vec(int weight_type, const void* W,
+                                        const float* X_f32, const void* X_q8,
+                                        float* out_f32, int M, int N, int K,
+                                        hipStream_t stream) {
+  constexpr const char* tag = "qfn_mmq_kquant_dense_vec";
+  const auto type = static_cast<ggml_type>(weight_type);
+  if (!dense_kquant(type) || !W || !(X_f32 || X_q8) || !out_f32 || M <= 0 ||
+      N <= 0 || K <= 0 || K % ggml_blck_size(type) != 0) {
+    fprintf(stderr, "%s: bad arguments type=%d M=%d N=%d K=%d\n", tag,
+            weight_type, M, N, K);
+    return -1;
+  }
+  ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
+  if (!ctx) {
+    fprintf(stderr, "%s: no HIP context\n", tag);
+    return -1;
+  }
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  const size_t input_bytes =
+      X_q8 ? 0 : (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
+  // One zeroed int32 serves as every token's expert ID.
+  ggml_hip_pool_alloc<char> scratch(ctx->pool(), input_bytes + sizeof(int32_t));
+  auto* zero_id = reinterpret_cast<int32_t*>(scratch.get() + input_bytes);
+  if (hipMemsetAsync(zero_id, 0, sizeof(int32_t), stream) != hipSuccess)
+    return -2;
+  if (!X_q8) {
+    quantize_row_q8_1_hip(X_f32, nullptr, scratch.get(), type, K, (int64_t)K,
+                          (int64_t)K, (int64_t)K * N, ne10_padded, 1, N, 1,
+                          stream);
+    if (hipGetLastError() != hipSuccess)
+      return -2;
+  }
+  const auto* input = static_cast<const block_q8_1*>(
+      X_q8 ? X_q8 : static_cast<const void*>(scratch.get()));
+  mul_mat_vec_dense_dispatch(W, type, input, zero_id, out_f32, K, M, N,
+                             int(ne10_padded / QK8_1), stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_kquant_dense(int weight_type, const void* W,
+                                    const float* X_f32, float* out_f32, int M,
+                                    int N, int K, hipStream_t stream) {
+  const auto type = static_cast<ggml_type>(weight_type);
+  if (!dense_kquant(type) || K % ggml_blck_size(type) != 0) {
+    fprintf(stderr, "qfn_mmq_kquant_dense: bad arguments type=%d K=%d\n",
+            weight_type, K);
+    return -1;
+  }
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      return qfn_mmq_dense_impl<GGML_TYPE_Q4_K>("qfn_mmq_q4_K_dense", W, X_f32,
+                                                out_f32, M, N, K, stream);
+    case GGML_TYPE_Q5_K:
+      return qfn_mmq_dense_impl<GGML_TYPE_Q5_K>("qfn_mmq_q5_K_dense", W, X_f32,
+                                                out_f32, M, N, K, stream);
+    case GGML_TYPE_Q5_1:
+      return qfn_mmq_dense_impl<GGML_TYPE_Q5_1>("qfn_mmq_q5_1_dense", W, X_f32,
+                                                out_f32, M, N, K, stream);
+    default:
+      return qfn_mmq_dense_impl<GGML_TYPE_Q6_K>("qfn_mmq_q6_K_dense", W, X_f32,
+                                                out_f32, M, N, K, stream);
+  }
+}
+
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
@@ -729,5 +798,7 @@ template void mul_mat_q_case<GGML_TYPE_Q4_K>(
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
 } // namespace qfn_mmq

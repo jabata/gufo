@@ -232,6 +232,7 @@ static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
         default:                return nullptr;
     }
 }
@@ -242,6 +243,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
         case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
         default:                return 1;
     }
 }
@@ -783,6 +785,53 @@ static void launch_moe(const void* weights, const block_q8_1* input,
           weights, input, ids, output, k, rows, row_stride, input_stride,
           rows * experts_used, rows * row_stride, rows, tokens, experts_used,
           nullptr, dst_slots);
+}
+
+// A dense matrix is the routed kernel's single expert: every token reads
+// expert 0 through one zero ID (ids_stride 0), so each token keeps the same
+// per-row dot-product order as a routed slot at any batch width.
+template<ggml_type type>
+static void launch_dense(const void* weights, const block_q8_1* input,
+                         const int32_t* zero_id, float* output, int k,
+                         int rows, int tokens, int input_stride,
+                         hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && tokens > 0);
+  constexpr int rows_per_wave = 2;
+  const int block_tokens = std::min(tokens, mmvq_moe_max_batch(type));
+  const int row_stride = k / ggml_blck_size(type);
+  mul_mat_vec_q_moe<type, rows_per_wave>
+      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, 1,
+              (tokens + block_tokens - 1) / block_tokens),
+         dim3(32, block_tokens), 0, stream>>>(
+          weights, input, zero_id, output, k, rows, row_stride, input_stride,
+          rows, rows * row_stride, rows, tokens, 0);
+}
+
+void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
+                                const block_q8_1* input,
+                                const int32_t* zero_id, float* output, int k,
+                                int rows, int tokens, int input_stride,
+                                hipStream_t stream) {
+  switch (type) {
+    case GGML_TYPE_Q4_K:
+      launch_dense<GGML_TYPE_Q4_K>(weights, input, zero_id, output, k, rows,
+                                   tokens, input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_K:
+      launch_dense<GGML_TYPE_Q5_K>(weights, input, zero_id, output, k, rows,
+                                   tokens, input_stride, stream);
+      break;
+    case GGML_TYPE_Q6_K:
+      launch_dense<GGML_TYPE_Q6_K>(weights, input, zero_id, output, k, rows,
+                                   tokens, input_stride, stream);
+      break;
+    case GGML_TYPE_Q5_1:
+      launch_dense<GGML_TYPE_Q5_1>(weights, input, zero_id, output, k, rows,
+                                   tokens, input_stride, stream);
+      break;
+    default:
+      GGML_ABORT("unsupported dense vector weight format");
+  }
 }
 
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,

@@ -18,13 +18,23 @@ struct MoeBatchGroup {
 
 // Tuned routed-vector batch limits for gfx1151.
 constexpr __host__ __device__ int mmvq_moe_max_batch(ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 4 : 8;
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+                   type == GGML_TYPE_Q6_K
+               ? 4
+               : 8;
 }
 
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                             const block_q8_1* input, float* output,
                             int k, int rows, int tokens, int input_stride,
                             hipStream_t stream);
+// Dense Q4_K/Q5_K/Q6_K/Q5_1 matrix-vector product over 1..n Q8_1 input rows;
+// `zero_id` is one device int32 holding 0. output is [tokens][rows].
+void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
+                                const block_q8_1* input,
+                                const int32_t* zero_id, float* output, int k,
+                                int rows, int tokens, int input_stride,
+                                hipStream_t stream);
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,

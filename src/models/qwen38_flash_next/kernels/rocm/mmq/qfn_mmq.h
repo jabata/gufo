@@ -63,6 +63,19 @@ int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,
                                 const void* X_q8, float* out_f32, int M, int N,
                                 int K, hipStream_t stream);
 
+// Dense Q4_K/Q5_K/Q6_K/Q5_1 matrix-vector product: out[n][m] for N token rows
+// of X_f32, or of X_q8 in qfn_mmq_quantize_q8_1's layout when non-null.
+// Each row's arithmetic is independent of N (the decode contract).
+int qfn_mmq_kquant_dense_vec(int weight_type, const void* W,
+                             const float* X_f32, const void* X_q8,
+                             float* out_f32, int M, int N, int K,
+                             hipStream_t stream);
+
+// Dense Q4_K/Q5_K/Q6_K/Q5_1 tiled GEMM for wide batches (prefill): out[n][m].
+int qfn_mmq_kquant_dense(int weight_type, const void* W, const float* X_f32,
+                         float* out_f32, int M, int N, int K,
+                         hipStream_t stream);
+
 int qfn_mmq_build_ids_maps(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, hipStream_t stream);

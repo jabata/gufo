@@ -4,6 +4,8 @@
 #include <string>
 #include <utility>
 
+#include "src/models/qwen38_flash_next/dense_formats.hpp"
+
 namespace gufo::models::qwen38_flash_next {
 namespace {
 
@@ -55,6 +57,14 @@ struct Binder {
   /// Binds `name` with the exact shape and one of the accepted formats.
   TensorRef Get(const std::string& name, std::uint64_t cols, std::uint64_t rows,
                 std::uint64_t experts, std::initializer_list<GgmlType> types,
+                bool required = true) {
+    return Get(name, cols, rows, experts,
+               std::span<const GgmlType>(types.begin(), types.size()),
+               required);
+  }
+
+  TensorRef Get(const std::string& name, std::uint64_t cols, std::uint64_t rows,
+                std::uint64_t experts, std::span<const GgmlType> types,
                 bool required = true) {
     TensorRef t;
     const auto* info = reader.FindTensor(name);
@@ -118,12 +128,10 @@ struct Binder {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    m.down =
-        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+    m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+                 kDenseMatrixTypes);
     m.up =
-        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1, kDenseMatrixTypes);
     if (with_inject) {
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
                      {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
@@ -138,8 +146,7 @@ struct Binder {
     const std::string p = "blk." + std::to_string(il) + ".";
     const std::uint64_t hidden = c.hidden_size;
     const std::uint64_t hc_dim = c.HcDim();
-    const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                        GgmlType::kF32};
+    const std::span<const GgmlType> dense = kDenseMatrixTypes;
     const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
                           GgmlType::kQ5_1, GgmlType::kQ8_0};
 
@@ -248,8 +255,7 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   ModelWeights w;
   w.config = *config;
   const Config& c = w.config;
-  const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kBF16,
-                      GgmlType::kF16, GgmlType::kF32};
+  const std::span<const GgmlType> dense = kDenseMatrixTypes;
 
   {
     // The vocabulary is the embedding row count; no metadata key carries it.

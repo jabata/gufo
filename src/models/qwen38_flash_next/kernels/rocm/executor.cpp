@@ -22,6 +22,7 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
+#include "src/models/qwen38_flash_next/dense_formats.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -1189,10 +1190,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   // The wide mixer route (F16 norm for the epilogue, tiled Q8 norm for the
   // W8A8 down projection) needs the four-stream geometry, 32-wide blocks and
-  // a Q8_0 down projection.
-  e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
-                   !model.layers().empty() &&
-                   model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+  // a Q8_0 down projection. Every mixer takes this route, so none may hold a
+  // sub-8-bit down projection (the W8A8 GEMM reads Q8_0 only).
+  const auto low_bit_down = [](const DeviceMixer& m) {
+    return IsDenseKQuant(m.down.type);
+  };
+  bool any_low_bit =
+      low_bit_down(model.hc_head()) ||
+      (model.has_mtp() &&
+       (low_bit_down(model.mtp().hc_attn) || low_bit_down(model.mtp().hc_ffn) ||
+        low_bit_down(model.mtp().nextn_head)));
+  for (const auto& layer : model.layers()) {
+    any_low_bit = any_low_bit || low_bit_down(layer.hc_attn) ||
+                  low_bit_down(layer.hc_ffn);
+  }
+  e->wide_mixer_ =
+      c.hc_count == 4 && c.hidden_size % 32 == 0 && !model.layers().empty() &&
+      model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0 && !any_low_bit;
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -1584,7 +1598,42 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
     }
     return true;
   }
+  if (IsDenseKQuant(w.type) && q.data != nullptr && w.cols == q.k) {
+    return DenseKQuant(w, q.x, q.data, out, q.n, error_msg);
+  }
   return Dense(w, q.x, out, q.n, error_msg);
+}
+
+bool Executor::DenseKQuant(const DeviceTensor& w, const float* x,
+                           const void* x_q8, float* out, std::uint32_t n_tokens,
+                           std::string* error_msg) const {
+  // Decode rows keep the vector kernel at every batch width; prefill takes
+  // the tiled GEMM at every chunk width (see SelectKQuantDenseKernel).
+  const int type = static_cast<int>(w.type);
+  const int m = static_cast<int>(w.rows);
+  const int k = static_cast<int>(w.cols);
+  if (SelectKQuantDenseKernel(prefill_phase) == KQuantDenseKernel::kVector) {
+    if (qfn_mmq_kquant_dense_vec(type, w.data, x, x_q8, out, m,
+                                 static_cast<int>(n_tokens), k, stream_) != 0) {
+      AssignError(error_msg, "K-quant GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  // The tiled GEMM quantizes its own activations per call; a wider call
+  // than its staging allows runs in pieces like the Q8_0 route.
+  const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
+  for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
+    const std::uint32_t rows = std::min(piece, n_tokens - r0);
+    if (qfn_mmq_kquant_dense(type, w.data,
+                             x + static_cast<std::size_t>(r0) * w.cols,
+                             out + static_cast<std::size_t>(r0) * w.rows, m,
+                             static_cast<int>(rows), k, stream_) != 0) {
+      AssignError(error_msg, "K-quant GEMM failed");
+      return false;
+    }
+  }
+  return true;
 }
 
 bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
@@ -1706,6 +1755,12 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       }
     }
     return true;
+  }
+  if (IsDenseKQuant(w.type)) {
+    // A decode batch reuses (or writes) the shared Q8_1 activation rows.
+    Q8Input q;
+    return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
+           DenseKQuant(w, x, q.data, out, n_tokens, error_msg);
   }
   if (!MatrixRows(n_tokens)) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,

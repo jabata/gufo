@@ -451,6 +451,11 @@ private:
   void DropReadyQ8() const;
   bool Dense(const DeviceTensor& w, const Q8Input& q, float* out,
              std::string* error_msg) const;
+  /// Q4_K/Q5_K/Q6_K/Q5_1 projection (IsDenseKQuant); `x_q8` (optional) holds
+  /// x's Q8_1 rows.
+  bool DenseKQuant(const DeviceTensor& w, const float* x, const void* x_q8,
+                   float* out, std::uint32_t n_tokens,
+                   std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
