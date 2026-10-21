@@ -737,6 +737,11 @@ std::optional<TextPreparedPrompt> TpMirroredRunner::PreparePrompt(
   return inner_->PreparePrompt(request);
 }
 
+std::optional<std::size_t> TpMirroredRunner::CountPromptTokens(
+    const ChatRequest& request) const {
+  return inner_->CountPromptTokens(request);
+}
+
 void TpMirroredRunner::SetPromptContext(
     TextRunnerState& state,
     std::shared_ptr<const TextPromptContext> context) const {

@@ -165,6 +165,8 @@ private:
   std::size_t id_;
 };
 
+constexpr std::size_t kToyPromptTokens = 42;
+
 /// A deterministic model whose next token depends on the whole sequence, so
 /// any divergence between the ranks changes later tokens too.
 class ToyRunner final : public TextModelRunner {
@@ -279,6 +281,11 @@ public:
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest&) const override {
     return std::nullopt;
+  }
+  /// Stands in for an image runner's visual token expansion.
+  [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest&) const override {
+    return kToyPromptTokens;
   }
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
@@ -941,6 +948,14 @@ int main() {
                   runner.DeviceUsable() == (status != Status::kLost),
               "TP scheduler observes the underlying GPU probe result");
     }
+  }
+  {
+    // Token counting (/v1/messages/count_tokens) must reach the wrapped
+    // runner, which knows its visual token expansion.
+    auto toy = std::make_shared<ToyRunner>(ToyOptions{});
+    const TpMirroredRunner runner(toy, std::make_shared<CaptureSink>());
+    Require(runner.CountPromptTokens(ChatRequest{}) == kToyPromptTokens,
+            "TP2 counts prompt tokens with the wrapped runner");
   }
   const std::vector<TextRunnerToken> prompt{5, 9, 13, 17, 21, 3, 8};
 
