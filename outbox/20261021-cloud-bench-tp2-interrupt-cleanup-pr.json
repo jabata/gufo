@@ -1,0 +1,14 @@
+{
+  "id": "20261021-cloud-bench-tp2-interrupt-cleanup-pr",
+  "action": "pr_create",
+  "repo": "neuhaus/gufo",
+  "head": "cloud/bench-tp2-interrupt-cleanup",
+  "title": "fix(bench): stop both TP2 ranks when startup is interrupted",
+  "body": "> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; an independent Claude Fable 5.1 review approved it before submission; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope (CPU build/tests only, cloud VM, no GPU, no RDMA, no second host): `python3 -I tests/tools/serving_bench_test.py` and `ctest --preset cpu-test -R '^serving_bench_test$'` pass on this branch (based on `rdma` fbaf343). The new check fails without the change, separately for `Server` and for `Tp2Server`. `tools/ci/check-docs.py` passes. The model bench itself was not run.\n\n## Problem\n\n`Server.start` and `Tp2Server.start` in `tools/gufo/model_bench/servers.py` stop their processes only on `Exception`. Both start their children with `start_new_session=True`, so a Ctrl-C in the terminal reaches only the bench script. Pressing it while the ranks load (`wait_ready` can wait for minutes) raises `KeyboardInterrupt`, which is not an `Exception`. And because `__enter__` raised, `__exit__` never runs. The local rank-0 container, the ssh client and the remote rank-1 container keep running. They hold both GPUs and the fixed bootstrap and control ports, so the next bench run fails until they are removed by hand.\n\n## Change\n\n- Both `start` methods catch `BaseException`. Cleanup is otherwise unchanged: the same `stop()` runs (remote cleanup over ssh, then local), and the interrupt is re-raised.\n- `tests/tools/serving_bench_test.py` patches the spawns and makes `wait_ready` raise `KeyboardInterrupt`. It then checks that the interrupt propagates and that `stop` ran once, for `Server` and for `Tp2Server`.\n\nBuilt in a cloud session (CPU only); Strix Halo validation pending.\n",
+  "draft": false,
+  "review": {
+    "reviewer": "claude-fable-5-1",
+    "verdict": "APPROVE",
+    "summary": "Two-line BaseException fix with a reproducible regression test; claims match evidence, disclosure and scope are exact, target branch is right. Approve."
+  }
+}
