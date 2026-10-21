@@ -1,0 +1,14 @@
+{
+  "id": "20261021-cloud-tp2-count-prompt-tokens-pr",
+  "action": "pr_create",
+  "repo": "neuhaus/gufo",
+  "head": "cloud/tp2-count-prompt-tokens",
+  "title": "fix(tp2): count prompt tokens with the wrapped runner",
+  "body": "> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; an independent Claude Fable 5.1 review approved it before submission; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope: CPU build/tests only, on an x86-64 cloud VM with no GPU and no RDMA, at `rdma` fbaf343 plus this commit. `cmake --preset cpu-test` (`ENGINE_ENABLE_HIP=OFF`; `GUFO_ENABLE_TP2_RDMA` needs HIP, so the RDMA code was not compiled). `ctest -L cpu`: 127/127 passed (6 of them report Skipped for missing model or reference files). `ctest -L tp2`: 4/4 passed. The new check in `tp_executor_test` fails without the fix (`FAIL: TP2 counts prompt tokens with the wrapped runner`) and passes with it. `tools/ci/check-format.py` with the pinned clang-tools passes. Nothing ran on Strix Halo or over RDMA. Built in a cloud session (CPU only); Strix Halo validation pending.\n\n**Problem.** `TpMirroredRunner` forwards `PreparePrompt` and `RenderAndTokenize` to the runner it wraps, but not `CountPromptTokens`. Under TP2 the scheduler's runner is the mirrored runner, so `InferenceBackend::count_chat_tokens` (`POST /v1/messages/count_tokens`) lands in the `TextModelRunner` default. That default runs the text-only `TextModelRunner::PreparePrompt`, which throws `model does not support image input` for any message with an image. The endpoint answers 400 `invalid_prompt`, even though the same request generates through the forwarded `PreparePrompt` when rank 0 has a vision encoder. The Qwen runners' own `CountPromptTokens` override, which counts the visual tokens, never runs. Text-only counts go through the same forwarded `RenderAndTokenize` either way, so this change does not affect them.\n\n**Fix.** Forward `CountPromptTokens` to the wrapped runner, like `PreparePrompt`. It is read-only and sends nothing to rank 1.\n\n**Test.** `tests/cli/tp_executor_test.cpp`: the toy runner overrides `CountPromptTokens` with a fixed count, and the wrapper must return that count.",
+  "draft": false,
+  "review": {
+    "reviewer": "claude-fable-5-1",
+    "verdict": "APPROVE",
+    "summary": "One-method forwarding fix in TpMirroredRunner with a targeted regression test; every claim in the body and evidence checks out against the code and a re-run of the CPU suites. Safe to publish."
+  }
+}
