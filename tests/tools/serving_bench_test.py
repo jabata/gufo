@@ -18,7 +18,7 @@ from gufo import serving_bench
 from gufo.model_bench.artifacts import public_command
 from gufo.model_bench.charts import render_charts
 from gufo.model_bench.config import BenchConfig, load_config
-from gufo.model_bench.llm import Session, _measure_depth, run_loading, run_multi, run_single, run_table
+from gufo.model_bench.llm import Session, _exit_reason, _measure_depth, run_loading, run_multi, run_single, run_table
 from gufo.model_bench.render import _serving_rate, layout_for, parse_table, render_table
 from gufo.model_bench.servers import HipMemory, Server, Tp2Server
 
@@ -691,6 +691,9 @@ check(server.failure_exit_code is None and server.stop.called,
 server.process.poll.return_value = -9
 server.__exit__(RuntimeError, RuntimeError("connection closed"), None)
 check(server.failure_exit_code == -9, "an actual process failure remains distinguishable")
+check([_exit_reason(code) for code in (-9, 137, 1, 139)] ==
+      ["OOM-killed", "OOM-killed", "crashed", "crashed"],
+      "a TP2 rank killed under podman or ssh (137) is reported as OOM, like -9")
 
 check(
     public_command([

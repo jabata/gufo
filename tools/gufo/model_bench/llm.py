@@ -55,6 +55,12 @@ WORDS = (
 ).split()
 
 
+def _exit_reason(exit_code: int) -> str:
+    """A SIGKILL is the kernel OOM killer on these hosts. A TP2 rank runs under
+    `podman run` or ssh, which report a killed child as 128 + 9."""
+    return "OOM-killed" if exit_code in (-9, 137) else "crashed"
+
+
 class Session:
     """Shared run state: config, target, server factory and identities."""
 
@@ -700,7 +706,7 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
                     # The server was killed (SIGKILL = the kernel OOM killer on this host):
                     # this depth and every deeper one are unmeasurable here, not TODO.
                     reason = (f"server exited with {exit_code} while measuring d{depth} "
-                              f"(context {context}); {'OOM-killed' if exit_code == -9 else 'crashed'}")
+                              f"(context {context}); {_exit_reason(exit_code)}")
                     for remaining in keys[keys.index(depth):]:
                         rows[str(remaining)] = {"unavailable": reason}
                         print(f"{table.id} d{remaining}: n/a, {reason}")
@@ -957,7 +963,7 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                     raise
                 # Killed mid-cohort (SIGKILL = the kernel OOM killer): this level and the
                 # larger ones are unmeasurable on this host.
-                reason = f"server exited with {exit_code} at C{users}; {'OOM-killed' if exit_code == -9 else 'crashed'}"
+                reason = f"server exited with {exit_code} at C{users}; {_exit_reason(exit_code)}"
                 combined = combined or {"artifactType": "model-bench-unavailable", "results": {}}
                 for remaining in keys[keys.index(users):]:
                     combined.setdefault("results", {})[f"c{remaining}"] = {"unavailable": reason}
