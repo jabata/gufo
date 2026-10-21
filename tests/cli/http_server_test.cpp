@@ -481,6 +481,8 @@ void TestRequestLogging() {
          std::string::npos);
   assert(log.find("cache=memory") != std::string::npos);
   assert(log.find("acceptance_pct=50.0") != std::string::npos);
+  assert(log.find("tokens_per_round=3.00 drafts_per_round=4.00") !=
+         std::string::npos);
   assert(log.find("rss_mib=") != std::string::npos);
   assert(log.find("error_code=server_exception") != std::string::npos);
   // A successful poll is quiet at the default level, and so is the received

@@ -185,6 +185,15 @@ inline std::string GenerationLogDetails(
   if (result.draft_tokens > 0)
     out << " acceptance_pct="
         << 100.0 * result.draft_accepted_tokens / result.draft_tokens;
+  // A verification round commits its accepted drafts and one more token.
+  if (result.draft_rounds > 0)
+    out << std::setprecision(2) << " tokens_per_round="
+        << static_cast<double>(result.draft_accepted_tokens +
+                               result.draft_rounds) /
+               result.draft_rounds
+        << " drafts_per_round="
+        << static_cast<double>(result.draft_tokens) / result.draft_rounds
+        << std::setprecision(1);
   if (result.lookup_tokens > 0)
     out << " lookup_accepted=" << result.lookup_accepted_tokens
         << " lookup_proposed=" << result.lookup_tokens;
