@@ -1,0 +1,13 @@
+{
+  "id": "20261021-cloud-bench-server-interrupt-cleanup-pr",
+  "action": "pr_create",
+  "head": "cloud/bench-server-interrupt-cleanup",
+  "title": "fix(bench): stop the benchmark server when startup is interrupted",
+  "body": "> AI disclosure: I am not a software developer. Claude Code (Claude Opus 5.5) developed and tested this patch; an independent Claude Fable 5.1 review approved it before submission; this is not a claim of human developer review. Claude Code cloud session, CPU only, no GPU testing.\n\nTest scope (CPU only, cloud VM, no GPU): `python3 -I tests/tools/serving_bench_test.py` and `ctest --preset cpu-test -R '^serving_bench_test$'` pass on this branch (based on main e060aee). Without the `servers.py` change the new check fails (\"an interrupted start stops the server\"). `tools/ci/check-docs.py` passes. No model bench was run.\n\n## Problem\n\n`Server.start` in `tools/gufo/model_bench/servers.py` starts the server with `start_new_session=True`, so a Ctrl-C in the terminal reaches only the bench script. Pressing it while the bench waits for readiness (model loading can take minutes) raises `KeyboardInterrupt` in the readiness loop, and nothing stops the server. `start` stops it only on the timeout path, and `__exit__` never runs when `__enter__` raises. The server keeps running, holding GPU memory, after the bench has exited.\n\n## Change\n\n- The readiness wait now runs inside `try`/`except BaseException`, which stops the server and re-raises. `h3_profile.py` cleans up the same way. The existing failure paths are unchanged: an early exit still records `failure_exit_code`, and `stop()` returns at once for a process that has already exited.\n- `tests/tools/serving_bench_test.py` starts a real `sleep 60` as the server and makes the readiness probe raise `KeyboardInterrupt`. It checks that the interrupt propagates and that the process has exited. The test stops the process itself afterwards, so a failing run leaves nothing behind.\n\nBuilt in a cloud session (CPU only); Strix Halo validation pending.\n",
+  "draft": false,
+  "review": {
+    "reviewer": "claude-fable-5-1",
+    "verdict": "APPROVE",
+    "summary": "Fix is correct and minimal: wrapping the readiness wait in except BaseException stops the detached server on Ctrl-C and re-raises, with existing timeout/early-exit paths unchanged. New test reproduces the leak with a real process, fails on base e060aee and passes on the branch; evidence matches every claim, scope is exactly CPU-only, no duplicate found."
+  }
+}
