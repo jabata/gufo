@@ -754,7 +754,8 @@ token, `null` before the start:
 ```
 
 `rank` is one-based, ties ranking by lower ID; `nonfinite` counts NaN or
-infinite logits when there are any. Earlier positions are prefilled and later
+infinite logits when there are any. A token whose own logit is not finite has
+`logprob: null` and ranks after every finite token. Earlier positions are prefilled and later
 ones advanced one token at a time, outside decode batches, so a scored request
 costs about one decode step per scored position. Each concurrent scored request
 adds its own single-token model call to every scheduler step, so other streams
