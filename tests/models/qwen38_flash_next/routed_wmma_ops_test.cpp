@@ -911,11 +911,63 @@ void CheckPairedMmq() {
     throw std::runtime_error("paired MMQ differs from separate projections");
 }
 
+/// The routed Q4_K vector kernel runs the dense vector kernel's lane
+/// arithmetic (dense_kquant_lane.hpp), which dense_kquant_ops checks against
+/// the dequantize oracle: each routed slot must equal the dense product of
+/// its expert's rows bit for bit, gated widths included (by way of
+/// CheckVectorGrouping).
+void CheckQ4KLaneMatchesDense() {
+  constexpr int experts = 8, rows = 640, cols = 2560, tokens = 5, used = 3;
+  const auto w = MakeQ4K(experts, rows, cols, 0x4C414E45U);
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 91;
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  std::vector<std::int32_t> ids(tokens * used);
+  for (int t = 0; t < tokens; ++t)
+    for (int j = 0; j < used; ++j)
+      ids[t * used + j] = (3 * t + 5 * j + 1) % experts;
+  ids[used + 1] = -1;  // an inactive slot is zero
+  auto* dw = Upload(w.packed);
+  auto* dx = Upload(x);
+  auto* di = Upload(ids);
+  auto* routed = Upload(std::vector<float>(tokens * used * rows, -1.0F));
+  auto* dense = Upload(std::vector<float>(experts * rows, -1.0F));
+  if (qfn_mmq_moe_vec(static_cast<int>(q::WeightType::kQ4_K), dw, dx, di,
+                      routed, rows, cols, tokens, experts, used, nullptr))
+    throw std::runtime_error("lane routed launch failed");
+  const auto got = Download(routed, tokens * used * rows);
+  for (int t = 0; t < tokens; ++t) {
+    if (qfn_mmq_kquant_dense_vec(static_cast<int>(q::WeightType::kQ4_K), dw,
+                                 dx + t * cols, nullptr, dense, experts * rows,
+                                 1, cols, nullptr))
+      throw std::runtime_error("dense reference launch failed");
+    const auto want = Download(dense, experts * rows);
+    for (int j = 0; j < used; ++j) {
+      const int e = ids[t * used + j];
+      const float* g = got.data() + (t * used + j) * rows;
+      for (int r = 0; r < rows; ++r) {
+        const float expect = e < 0 ? 0.0F : want[e * rows + r];
+        if (std::memcmp(&expect, &g[r], sizeof(float)) != 0)
+          throw std::runtime_error(
+              "routed Q4_K differs from the dense lane product at token " +
+              std::to_string(t) + " slot " + std::to_string(j) + " row " +
+              std::to_string(r));
+      }
+    }
+  }
+  for (void* p :
+       {static_cast<void*>(dw), static_cast<void*>(dx), static_cast<void*>(di),
+        static_cast<void*>(routed), static_cast<void*>(dense)})
+    CheckHip(hipFree(p), "lane check free");
+}
+
 }  // namespace
 
 int main() {
   try {
     ReportVectorAccuracy();
+    CheckQ4KLaneMatchesDense();
     CheckVectorGrouping();
     CheckVectorGrouping(true);
     CheckPairedMmq();

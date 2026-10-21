@@ -50,6 +50,15 @@ int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
                                int tokens, int experts, int experts_used,
                                hipStream_t stream);
 
+// Diagnostics (kernel benches): qfn_mmq_moe_gated_vec_preq with its Q4_K
+// kernel forced. route 0 is the production lane kernel, 1 the scalar
+// vec_dot kernels it replaced (their sums differ in rounding).
+int qfn_mmq_moe_gated_vec_route(int weight_type, const void* gate,
+                                const void* up, const void* x_q8,
+                                const int32_t* ids, float* out, int m, int k,
+                                int tokens, int experts, int experts_used,
+                                int route, hipStream_t stream);
+
 size_t qfn_mmq_q8_1_bytes(int N, int K);
 
 int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,

@@ -1133,6 +1133,189 @@ void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
   }
 }
 
+// Routed Q4_K decode on the dense lane arithmetic (dense_kquant_lane.hpp):
+// eight lanes per super-block with 128-bit loads, and the weights of an
+// expert row decoded once for every token routed to it. Without `groups`,
+// job j is slot j % experts_used of token j / experts_used. With them, the
+// jobs are group_moe_batch's list (count first, up to eight tokens each). A
+// token's sum does not depend on the job's other tokens, so the scalar,
+// paired and gated entries give the same bits at every width. Gate and up
+// stay in separate waves, as in the scalar kernel.
+constexpr int kMoeKqRows = 2;
+constexpr int kMoeKqGroupBlocks = 128;
+
+template<int tokens, bool gated>
+__launch_bounds__(gated ? 64 : 32) static __global__
+    void mul_mat_vec_moe_kq(const std::uint8_t* __restrict__ gate,
+                            const std::uint8_t* __restrict__ up,
+                            const block_q8_1* __restrict__ input,
+                            const int32_t* __restrict__ ids,
+                            const int32_t* __restrict__ groups,
+                            float* __restrict__ output, int blocks_per_row,
+                            int rows, int jobs, int experts_used,
+                            int input_stride) {
+  using Lane = gufo::models::qwen38_flash_next::kquant_lane::Q4KLane;
+  using gufo::models::qwen38_flash_next::kquant_lane::kQ8_1Bytes;
+  constexpr int per_iter = 32 / Lane::kLanes;
+  const int lane = threadIdx.x;
+  const bool is_up = gated && threadIdx.y != 0;
+  const int sub = lane % Lane::kLanes;
+  const int row0 = blockIdx.x * kMoeKqRows;
+  const std::uint8_t* weights = is_up ? up : gate;
+  const int count = groups != nullptr ? groups[0] : jobs;
+  const auto* list = reinterpret_cast<const MoeBatchGroup*>(groups + 1);
+  for (int job = blockIdx.y; job < count; job += gridDim.y) {
+    int expert;
+    int anchor;
+    int token[tokens];
+    uint32_t slots[tokens];
+    if (groups != nullptr) {
+      const MoeBatchGroup& group = list[job];
+      expert = group.expert;
+      anchor = group.anchor;
+#pragma unroll
+      for (int t = 0; t < tokens; ++t) {
+        token[t] = group.token[t];
+        slots[t] = group.slots[t];
+      }
+    } else {
+      expert = ids[job];
+      anchor = job;
+      token[0] = job / experts_used;
+      slots[0] = uint32_t{1} << (job % experts_used);
+#pragma unroll
+      for (int t = 1; t < tokens; ++t) {
+        token[t] = 0;
+        slots[t] = 0;
+      }
+    }
+    if (expert < 0) {
+      // Inactive slots still write zero to every output row.
+      if (!is_up && lane < kMoeKqRows && row0 + lane < rows)
+        output[std::size_t(anchor) * rows + row0 + lane] = 0.0f;
+      continue;
+    }
+    // A ragged tile reads the last valid row again; it is never stored.
+    const std::uint8_t* row_ptr[kMoeKqRows];
+#pragma unroll
+    for (int r = 0; r < kMoeKqRows; ++r)
+      row_ptr[r] = weights + (std::size_t(expert) * rows +
+                              min(row0 + r, rows - 1)) *
+                                 blocks_per_row * Lane::kBlockBytes;
+    const std::uint8_t* x[tokens];
+#pragma unroll
+    for (int t = 0; t < tokens; ++t)
+      x[t] = reinterpret_cast<const std::uint8_t*>(
+          input + std::size_t(token[t]) * input_stride);
+    float acc[tokens][kMoeKqRows] = {};
+    for (int kb = lane / Lane::kLanes; kb < blocks_per_row; kb += per_iter) {
+      Lane w[kMoeKqRows];
+#pragma unroll
+      for (int r = 0; r < kMoeKqRows; ++r)
+        w[r] = Lane(row_ptr[r] + std::size_t(kb) * Lane::kBlockBytes, sub);
+#pragma unroll
+      for (int t = 0; t < tokens; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const std::uint8_t* xb =
+            x[t] + std::size_t(kb) * Lane::kQ8Blocks * kQ8_1Bytes;
+#pragma unroll
+        for (int r = 0; r < kMoeKqRows; ++r)
+          acc[t][r] = w[r].Dot(xb, sub, acc[t][r]);
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      if (slots[t] == 0)
+        continue;
+#pragma unroll
+      for (int r = 0; r < kMoeKqRows; ++r)
+        acc[t][r] = warp_reduce_sum<32>(acc[t][r]);
+    }
+    // Every lane holds every sum after the butterfly; lane t * rows + r
+    // stores item (t, r) to each of the token's slots for this expert.
+    const auto store = [&](int t, int r, float value) {
+      uint32_t bits = slots[t];
+      while (bits) {
+        const int slot = __ffs(static_cast<int>(bits)) - 1;
+        output[(std::size_t(token[t]) * experts_used + slot) * rows + row0 +
+               r] = value;
+        bits &= bits - 1;
+      }
+    };
+    if constexpr (gated) {
+      __shared__ float values[2][tokens][kMoeKqRows];
+      if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+#pragma unroll
+          for (int r = 0; r < kMoeKqRows; ++r)
+            values[is_up][t][r] = isfinite(acc[t][r]) ? acc[t][r] : 0.0f;
+        }
+      }
+      __syncthreads();
+      if (!is_up) {
+#pragma unroll
+        for (int t = 0; t < tokens; ++t) {
+#pragma unroll
+          for (int r = 0; r < kMoeKqRows; ++r) {
+            if (lane == t * kMoeKqRows + r && slots[t] != 0 &&
+                row0 + r < rows) {
+              const float g = values[0][t][r];
+              const float u = values[1][t][r];
+              store(t, r, (g * (1.0f / (1.0f + __expf(-g)))) * u);
+            }
+          }
+        }
+      }
+      // The next job rewrites values.
+      __syncthreads();
+    } else {
+#pragma unroll
+      for (int t = 0; t < tokens; ++t) {
+#pragma unroll
+        for (int r = 0; r < kMoeKqRows; ++r) {
+          if (lane == t * kMoeKqRows + r && slots[t] != 0 && row0 + r < rows)
+            store(t, r, isfinite(acc[t][r]) ? acc[t][r] : 0.0f);
+        }
+      }
+    }
+  }
+}
+
+// `groups` null: one job per (token, slot). Otherwise group_moe_batch's
+// list, which holds at most tokens * experts_used groups.
+static void launch_moe_kq(const void* gate, const void* up,
+                          const block_q8_1* input, const int32_t* ids,
+                          const int32_t* groups, float* output, int k,
+                          int rows, int tokens, int experts_used,
+                          int input_stride, bool gated, hipStream_t stream) {
+  GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens > 0);
+  const auto* g = static_cast<const std::uint8_t*>(gate);
+  const auto* u = static_cast<const std::uint8_t*>(up);
+  const int blocks_per_row = k / QK_K;
+  const int jobs = tokens * experts_used;
+  const int row_blocks = (rows + kMoeKqRows - 1) / kMoeKqRows;
+  if (groups == nullptr) {
+    const dim3 grid(row_blocks, std::min(jobs, 65535));
+    if (gated)
+      mul_mat_vec_moe_kq<1, true><<<grid, dim3(32, 2), 0, stream>>>(
+          g, u, input, ids, nullptr, output, blocks_per_row, rows, jobs,
+          experts_used, input_stride);
+    else
+      mul_mat_vec_moe_kq<1, false><<<grid, dim3(32, 1), 0, stream>>>(
+          g, nullptr, input, ids, nullptr, output, blocks_per_row, rows, jobs,
+          experts_used, input_stride);
+    return;
+  }
+  GGML_ASSERT(gated);
+  const dim3 grid(row_blocks, std::min(jobs, kMoeKqGroupBlocks));
+  mul_mat_vec_moe_kq<MMVQ_MAX_BATCH_SIZE, true>
+      <<<grid, dim3(32, 2), 0, stream>>>(g, u, input, nullptr, groups, output,
+                                         blocks_per_row, rows, jobs,
+                                         experts_used, input_stride);
+}
+
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
@@ -1174,8 +1357,9 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q4_K:
-            launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
-                                          experts_used, input_stride, stream);
+            launch_moe_kq(weights, nullptr, input, ids, nullptr, output, k,
+                          rows, tokens, experts_used, input_stride, false,
+                          stream);
             break;
         case GGML_TYPE_Q5_K:
             launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
@@ -1189,8 +1373,19 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
-                           hipStream_t stream) {
+                           hipStream_t stream, int route) {
   GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_ROUTED_BATCH);
+  if (type == GGML_TYPE_Q4_K && route == 0) {
+    // Above one token, group_moe_batch shares each expert's weights.
+    if (tokens > 1) {
+      GGML_ASSERT(groups && experts_used <= 32);
+      group_moe_batch<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
+          ids, groups, tokens, experts_used);
+    }
+    launch_moe_kq(gate, up, input, ids, tokens > 1 ? groups : nullptr, output,
+                  k, rows, tokens, experts_used, input_stride, true, stream);
+    return;
+  }
   if (tokens > MMVQ_MAX_BATCH_SIZE) {
     GGML_ASSERT(type == GGML_TYPE_Q4_K && groups && experts_used <= 32);
     group_moe_batch<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(

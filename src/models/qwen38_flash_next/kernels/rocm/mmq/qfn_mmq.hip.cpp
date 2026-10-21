@@ -355,7 +355,7 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  int n_experts, int n_expert_used,
                                  hipStream_t stream, const void* W_b,
                                  float* out_b, bool gated,
-                                 const void* X_q8 = nullptr) {
+                                 const void* X_q8 = nullptr, int route = 0) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
@@ -373,6 +373,13 @@ static int moe_vector_projection(int weight_type, const void* W,
       n_expert_used <= 0) {
     fprintf(stderr, "%s: bad shape M=%d K=%d ntok=%d nexp=%d nused=%d\n", tag,
             M, K, n_tokens, n_experts, n_expert_used);
+    return -1;
+  }
+  // The Q4_K lane kernel reads each block with 128-bit loads.
+  if (type == GGML_TYPE_Q4_K &&
+      (reinterpret_cast<std::uintptr_t>(W) % 16 != 0 ||
+       reinterpret_cast<std::uintptr_t>(W_b) % 16 != 0)) {
+    fprintf(stderr, "%s: Q4_K weights are not 16-byte aligned\n", tag);
     return -1;
   }
   if (K % ggml_blck_size(type) != 0) {
@@ -412,14 +419,17 @@ static int moe_vector_projection(int weight_type, const void* W,
       !gated && !W_b && !X_q8 &&
       (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) && K == 640 &&
       n_expert_used == 1 && n_tokens > 1;
+  // Batch groups (group_moe_batch) start with a count the launch zeroes.
+  const bool batch_groups =
+      gated && n_tokens > 1 &&
+      (n_tokens > MMVQ_MAX_BATCH_SIZE || (type == GGML_TYPE_Q4_K && route == 0));
   const size_t group_bytes =
       by_expert ? 2 * size_t(n_tokens) * sizeof(int32_t)
+      : batch_groups
+          ? mmvq_moe_batch_group_bytes(n_tokens, n_expert_used)
       : gated && n_tokens > 1
-          ? (n_tokens > MMVQ_MAX_BATCH_SIZE
-                 ? sizeof(int32_t) +
-                       size_t(n_tokens) * n_expert_used * sizeof(MoeBatchGroup)
-                 : size_t(mmvq_moe_group_ints(n_tokens, n_expert_used)) *
-                       sizeof(int32_t))
+          ? size_t(mmvq_moe_group_ints(n_tokens, n_expert_used)) *
+                sizeof(int32_t)
           : 0;
   // A caller-quantized input (the same rows quantize_row_q8_1 writes) only
   // needs the pool for the gated route's expert groups.
@@ -463,11 +473,11 @@ static int moe_vector_projection(int weight_type, const void* W,
 
   const int input_stride = ne10_padded / QK8_1;
   if (gated) {
-    if (n_tokens > MMVQ_MAX_BATCH_SIZE &&
+    if (batch_groups &&
         hipMemsetAsync(groups, 0, sizeof(int32_t), stream) != hipSuccess)
       return -2;
     mul_mat_vec_moe_gated(W, W_b, type, input, ids, groups, out_f32, K, M,
-                          n_tokens, n_expert_used, input_stride, stream);
+                          n_tokens, n_expert_used, input_stride, stream, route);
     err = hipGetLastError();
     if (err != hipSuccess) {
       fprintf(stderr, "%s: gated vector launch failed: %s\n", tag,
@@ -527,6 +537,21 @@ extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
   return moe_vector_projection(weight_type, gate, nullptr, ids, out, m, k,
                                tokens, experts, experts_used, stream, up,
                                nullptr, true, x_q8);
+}
+
+extern "C" int qfn_mmq_moe_gated_vec_route(int weight_type, const void* gate,
+                                           const void* up, const void* x_q8,
+                                           const int32_t* ids, float* out,
+                                           int m, int k, int tokens,
+                                           int experts, int experts_used,
+                                           int route, hipStream_t stream) {
+  if (route != 0 && route != 1) {
+    fprintf(stderr, "qfn_mmq_moe_gated_vec_route: route %d\n", route);
+    return -1;
+  }
+  return moe_vector_projection(weight_type, gate, nullptr, ids, out, m, k,
+                               tokens, experts, experts_used, stream, up,
+                               nullptr, true, x_q8, route);
 }
 
 extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,

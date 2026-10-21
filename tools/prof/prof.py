@@ -128,6 +128,9 @@ STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
     ],
     "qwen-flash": [
         ("mul_mat_q8_decode_batch", "dense: quantized vectors"),
+        ("mul_mat_vec_dense_kq", "dense: k-quant vectors"),
+        ("mul_mat_kq_decode_batch", "dense: k-quant wmma"),
+        ("mul_mat_vec_moe_kq", "moe: lane vectors"),
         ("RoutedF16", "moe: f16 projections"),
         ("mul_mat_vec_moe_batch", "moe: grouped gate/up"),
         ("mul_mat_vec_moe_grouped", "moe: grouped gate/up"),

@@ -47,11 +47,18 @@ constexpr int mmvq_moe_group_ints(int tokens, int experts_used) {
   return tokens * experts_used * (tokens + 1) + 2 * (tokens * experts_used + 1);
 }
 
+constexpr size_t mmvq_moe_batch_group_bytes(int tokens, int experts_used) {
+  return sizeof(int32_t) + size_t(tokens) * experts_used * sizeof(MoeBatchGroup);
+}
+
+// Q4_K above one token takes `groups` sized and zero-counted for
+// group_moe_batch (mmvq_moe_batch_group_bytes). `route` (diagnostics) 1
+// forces the scalar Q4_K kernels the lane kernel replaced.
 void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
-                           hipStream_t stream);
+                           hipStream_t stream, int route = 0);
 
 void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
                                  const block_q8_1* input, const int32_t* groups,
