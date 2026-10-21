@@ -63,13 +63,22 @@ int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,
                                 const void* X_q8, float* out_f32, int M, int N,
                                 int K, hipStream_t stream);
 
-// Dense Q4_K/Q5_K/Q6_K/Q5_1 matrix-vector product: out[n][m] for N token rows
-// of X_f32, or of X_q8 in qfn_mmq_quantize_q8_1's layout when non-null.
-// Each row's arithmetic is independent of N (the decode contract).
+// Dense Q4_K/Q5_K/Q6_K/Q5_1 decode product: out[n][m] for N token rows of
+// X_f32, or of X_q8 in qfn_mmq_quantize_q8_1's layout when non-null. Each
+// row's arithmetic is independent of N within 1..8 rows (vector kernel) and
+// within wider batches (the WMMA kernel for large Q4_K/Q5_K matrices).
 int qfn_mmq_kquant_dense_vec(int weight_type, const void* W,
                              const float* X_f32, const void* X_q8,
                              float* out_f32, int M, int N, int K,
                              hipStream_t stream);
+
+// Diagnostics (kernel benches): qfn_mmq_kquant_dense_vec on X_q8 with its
+// kernel forced. route 0 chooses as qfn_mmq_kquant_dense_vec does, 1 takes
+// the vector kernel at every width, 2 the WMMA kernel (Q4_K/Q5_K only).
+int qfn_mmq_kquant_dense_vec_route(int weight_type, const void* W,
+                                   const void* X_q8, float* out_f32, int M,
+                                   int N, int K, int route,
+                                   hipStream_t stream);
 
 // Dense Q4_K/Q5_K/Q6_K/Q5_1 tiled GEMM for wide batches (prefill): out[n][m].
 int qfn_mmq_kquant_dense(int weight_type, const void* W, const float* X_f32,

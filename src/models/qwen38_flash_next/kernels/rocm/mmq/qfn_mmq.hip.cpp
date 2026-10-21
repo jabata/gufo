@@ -733,36 +733,57 @@ extern "C" int qfn_mmq_kquant_dense_vec(int weight_type, const void* W,
                                         hipStream_t stream) {
   constexpr const char* tag = "qfn_mmq_kquant_dense_vec";
   const auto type = static_cast<ggml_type>(weight_type);
+  // The vector kernel loads whole Q4_K/Q5_K heads and quant chunks.
+  const std::uintptr_t alignment = type == GGML_TYPE_Q5_1 ? 8 : 16;
   if (!dense_kquant(type) || !W || !(X_f32 || X_q8) || !out_f32 || M <= 0 ||
-      N <= 0 || K <= 0 || K % ggml_blck_size(type) != 0) {
+      N <= 0 || K <= 0 || K % ggml_blck_size(type) != 0 ||
+      reinterpret_cast<std::uintptr_t>(W) % alignment != 0) {
     fprintf(stderr, "%s: bad arguments type=%d M=%d N=%d K=%d\n", tag,
             weight_type, M, N, K);
     return -1;
   }
-  ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
-  if (!ctx) {
-    fprintf(stderr, "%s: no HIP context\n", tag);
-    return -1;
-  }
   const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
-  const size_t input_bytes =
-      X_q8 ? 0 : (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
-  // One zeroed int32 serves as every token's expert ID.
-  ggml_hip_pool_alloc<char> scratch(ctx->pool(), input_bytes + sizeof(int32_t));
-  auto* zero_id = reinterpret_cast<int32_t*>(scratch.get() + input_bytes);
-  if (hipMemsetAsync(zero_id, 0, sizeof(int32_t), stream) != hipSuccess)
-    return -2;
+  const block_q8_1* input = static_cast<const block_q8_1*>(X_q8);
+  ggml_hip_pool_alloc<char> scratch;
   if (!X_q8) {
+    ggml_backend_hip_context* ctx = get_ctx_for_device(ggml_hip_get_device());
+    if (!ctx) {
+      fprintf(stderr, "%s: no HIP context\n", tag);
+      return -1;
+    }
+    scratch.alloc(ctx->pool(),
+                  (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1);
     quantize_row_q8_1_hip(X_f32, nullptr, scratch.get(), type, K, (int64_t)K,
                           (int64_t)K, (int64_t)K * N, ne10_padded, 1, N, 1,
                           stream);
     if (hipGetLastError() != hipSuccess)
       return -2;
+    input = reinterpret_cast<const block_q8_1*>(scratch.get());
   }
-  const auto* input = static_cast<const block_q8_1*>(
-      X_q8 ? X_q8 : static_cast<const void*>(scratch.get()));
-  mul_mat_vec_dense_dispatch(W, type, input, zero_id, out_f32, K, M, N,
+  mul_mat_vec_dense_dispatch(W, type, input, out_f32, K, M, N,
                              int(ne10_padded / QK8_1), stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_kquant_dense_vec_route(int weight_type, const void* W,
+                                              const void* X_q8, float* out_f32,
+                                              int M, int N, int K, int route,
+                                              hipStream_t stream) {
+  const auto type = static_cast<ggml_type>(weight_type);
+  if (route < 0 || route > 2 || !X_q8 ||
+      (route == 2 && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K))
+    return -1;
+  if (route == 0)
+    return qfn_mmq_kquant_dense_vec(weight_type, W, nullptr, X_q8, out_f32, M,
+                                    N, K, stream);
+  if (!dense_kquant(type) || !W || !out_f32 || M <= 0 || N <= 0 || K <= 0 ||
+      K % ggml_blck_size(type) != 0 ||
+      reinterpret_cast<std::uintptr_t>(W) % (type == GGML_TYPE_Q5_1 ? 8 : 16) !=
+          0)
+    return -1;
+  const int stride = int(GGML_PAD((int64_t)K, MATRIX_ROW_PADDING) / QK8_1);
+  mul_mat_vec_dense_dispatch(W, type, static_cast<const block_q8_1*>(X_q8),
+                             out_f32, K, M, N, stride, stream, route);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 

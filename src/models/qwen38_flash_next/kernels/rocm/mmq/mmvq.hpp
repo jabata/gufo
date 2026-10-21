@@ -28,13 +28,14 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                             const block_q8_1* input, float* output,
                             int k, int rows, int tokens, int input_stride,
                             hipStream_t stream);
-// Dense Q4_K/Q5_K/Q6_K/Q5_1 matrix-vector product over 1..n Q8_1 input rows;
-// `zero_id` is one device int32 holding 0. output is [tokens][rows].
+// Dense Q4_K/Q5_K/Q6_K/Q5_1 matrix-vector product over 1..n Q8_1 input rows,
+// reading the weights once per 64 rows. output is [tokens][rows]. Q4_K/Q5_K
+// weights must be 16-byte aligned, Q5_1 weights 8-byte aligned. `route`
+// (diagnostics) forces the vector (1) or WMMA (2) kernel.
 void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
-                                const block_q8_1* input,
-                                const int32_t* zero_id, float* output, int k,
+                                const block_q8_1* input, float* output, int k,
                                 int rows, int tokens, int input_stride,
-                                hipStream_t stream);
+                                hipStream_t stream, int route = 0);
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,

@@ -17,8 +17,10 @@ using gufo::core::GgmlType;
 
 /// Dense Q4_K/Q5_K/Q6_K/Q5_1 projections (decode vector kernel and prefill
 /// tiled GEMM) against the dequantize-then-F32 oracle, plus the decode
-/// contract: a row's result does not depend on the batch width or on who
-/// quantized its activations.
+/// contract: a row's result does not depend on the batch width within the
+/// vector kernel's 1 to 8 rows or the wide kernels' 9 to 72 rows (eight-token
+/// waves, 16-token WMMA tiles, 64-token blocks), or on who quantized its
+/// activations.
 namespace {
 
 void CheckHip(hipError_t error, const char* operation) {
@@ -151,21 +153,44 @@ void CheckShape(GgmlType type, std::size_t m, std::size_t k) {
     }
   };
   const int type_id = static_cast<int>(type);
-  std::vector<float> single;
-  for (const std::size_t n : {1UL, 2UL, 4UL, 5UL, 8UL, 13UL, 64UL}) {
+  // Each token alone: the reference bits for every batch width.
+  for (std::size_t n = 0; n < kMaxTokens; ++n) {
+    Require(qfn_mmq_kquant_dense_vec(type_id, dw, dx + n * k, nullptr,
+                                     dout + n * m, static_cast<int>(m), 1,
+                                     static_cast<int>(k), nullptr) == 0,
+            tag + " single-token vector launch");
+  }
+  const std::vector<float> single = Download(dout, kMaxTokens * m);
+  check(single, kMaxTokens, "single-token vector");
+  // The kernel loads whole blocks: an unaligned matrix is rejected.
+  Require(qfn_mmq_kquant_dense_vec(type_id, dw + 4, dx, nullptr, dout,
+                                   static_cast<int>(m), 1, static_cast<int>(k),
+                                   nullptr) != 0,
+          tag + " unaligned weights accepted");
+  // The widest batch: the reference bits above eight rows (the large
+  // Q4_K/Q5_K matrices take the WMMA kernel there).
+  Require(qfn_mmq_kquant_dense_vec(
+              type_id, dw, dx, nullptr, dout, static_cast<int>(m),
+              static_cast<int>(kMaxTokens), static_cast<int>(k), nullptr) == 0,
+          tag + " wide vector launch");
+  const std::vector<float> wide = Download(dout, kMaxTokens * m);
+  check(wide, kMaxTokens, "wide vector");
+  for (const std::size_t n :
+       {1UL, 2UL, 4UL, 5UL, 8UL, 9UL, 13UL, 16UL, 31UL, 64UL, 72UL}) {
+    CheckHip(hipMemset(dout, 0xFF, kMaxTokens * m * sizeof(float)), "poison");
     Require(qfn_mmq_kquant_dense_vec(type_id, dw, dx, nullptr, dout,
                                      static_cast<int>(m), static_cast<int>(n),
                                      static_cast<int>(k), nullptr) == 0,
             tag + " vector launch");
     const auto got = Download(dout, n * m);
     check(got, n, "vector");
-    if (n == 1) {
-      single = got;
-    } else {
-      // Decode contract: the first row is bitwise the single-token result.
-      Require(std::memcmp(got.data(), single.data(), m * sizeof(float)) == 0,
-              tag + " vector result depends on the batch width");
-    }
+    // Decode contract: up to eight rows, every row is bitwise its
+    // single-token result; above eight, bitwise the same at every width.
+    const auto& expected = n <= 8 ? single : wide;
+    Require(
+        std::memcmp(got.data(), expected.data(), n * m * sizeof(float)) == 0,
+        tag + " vector result depends on the batch width (n=" +
+            std::to_string(n) + ")");
     // Pre-quantized rows (a producer's or Quantize's) give identical bits.
     Require(qfn_mmq_quantize_q8_1(dx, dq8, static_cast<int>(n),
                                   static_cast<int>(k), nullptr) == 0,
@@ -206,9 +231,16 @@ int main() {
       CheckShape(type, 640, 2560);
       CheckShape(type, 512, 6144);
       CheckShape(type, 320, 10240);
+      // More than 1024 rows: one wave per row pair, no K split; Q4_K and
+      // Q5_K take the WMMA kernel above eight rows.
+      CheckShape(type, 2050, 2560);
+      CheckShape(type, 1030, 6144);
     }
     CheckShape(GgmlType::kQ5_1, 512, 640);
     CheckShape(GgmlType::kQ5_1, 1024, 320);
+    // Four rows per wave, with a ragged last row group.
+    CheckShape(GgmlType::kQ5_1, 2562, 640);
+    CheckShape(GgmlType::kQ5_1, 2051, 320);
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << "\n";
     return 1;

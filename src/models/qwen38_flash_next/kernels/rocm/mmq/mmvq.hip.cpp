@@ -1,4 +1,5 @@
 #include "qfn_mmq_prelude.h"
+#include "src/models/qwen38_flash_next/dense_kquant_lane.hpp"
 namespace qfn_mmq {
 #include "mmvq.hpp"
 #include "unary.hpp"
@@ -248,9 +249,9 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-template<ggml_type type, int c_rows_per_block, bool gated = false,
-         int max_tokens = mmvq_moe_max_batch(type)>
-__launch_bounds__(max_tokens * (gated ? 64 : 32), 1) static __global__
+template<ggml_type type, int c_rows_per_block, bool gated = false>
+__launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
+                  1) static __global__
     void mul_mat_vec_q_moe(const void* __restrict__ weights,
                            const void* __restrict__ vy,
                            const int32_t* __restrict__ ids,
@@ -787,49 +788,345 @@ static void launch_moe(const void* weights, const block_q8_1* input,
           nullptr, dst_slots);
 }
 
-// A dense matrix is the routed kernel's single expert: every token reads
-// expert 0 through one zero ID (ids_stride 0), so each token keeps the same
-// per-row dot-product order as a routed slot at any batch width. All tokens
-// share the weights, so one block takes up to MMVQ_MAX_BATCH_SIZE of them
-// (one weight pass for a whole verification batch).
-template<ggml_type type>
-static void launch_dense(const void* weights, const block_q8_1* input,
-                         const int32_t* zero_id, float* output, int k,
-                         int rows, int tokens, int input_stride,
-                         hipStream_t stream) {
-  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && tokens > 0);
-  constexpr int rows_per_wave = 2;
-  const int block_tokens = std::min(tokens, MMVQ_MAX_BATCH_SIZE);
-  const int row_stride = k / ggml_blck_size(type);
-  mul_mat_vec_q_moe<type, rows_per_wave, false, MMVQ_MAX_BATCH_SIZE>
-      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, 1,
-              (tokens + block_tokens - 1) / block_tokens),
-         dim3(32, block_tokens), 0, stream>>>(
-          weights, input, zero_id, output, k, rows, row_stride, input_stride,
-          rows, rows * row_stride, rows, tokens, 0);
+// Dense K-quant decode: one launch reads each weight once for up to 64
+// tokens. A lane decodes its weights into registers once and reuses them for
+// eight tokens; the token waves of a block share the weight rows through the
+// cache. The lane geometry and arithmetic (dense_kquant_lane.hpp) do not
+// depend on the batch width or a token's position, so a token's result is the
+// same at every width. Few-row shapes split K over `ksplit` waves and combine
+// them in a fixed order.
+constexpr int kDenseTokenWaves = 8;
+
+// Q6_K keeps the llama.cpp lane geometry (one lane per 8 weights).
+struct Q6KVecDotLane {
+  static constexpr int kLanes = QI6_K / VDR_Q6_K_Q8_1_MMVQ;
+  static constexpr int kBlockBytes = sizeof(block_q6_K);
+  static constexpr int kQ8Blocks = QK_K / QK8_1;
+  const std::uint8_t* block;
+  Q6KVecDotLane() = default;
+  __device__ __forceinline__ Q6KVecDotLane(const std::uint8_t* b, int)
+      : block(b) {}
+  __device__ __forceinline__ float Dot(const std::uint8_t* x, int sub,
+                                       float acc) const {
+    return acc + vec_dot_q6_K_q8_1(block,
+                                   reinterpret_cast<const block_q8_1*>(x), 0,
+                                   VDR_Q6_K_Q8_1_MMVQ * sub);
+  }
+};
+
+template<class Lane, int tokens, int rows_per_wave, int ksplit>
+__launch_bounds__(32 * ksplit * kDenseTokenWaves) static __global__
+    void mul_mat_vec_dense_kq(const std::uint8_t* __restrict__ weights,
+                              const block_q8_1* __restrict__ input,
+                              float* __restrict__ output, int blocks_per_row,
+                              int rows, int input_stride, int n_tokens) {
+  using gufo::models::qwen38_flash_next::kquant_lane::kQ8_1Bytes;
+  constexpr int per_iter = 32 / Lane::kLanes;
+  const int lane = threadIdx.x;
+  const int part = threadIdx.y;
+  const int first_token = (blockIdx.y * blockDim.z + threadIdx.z) * tokens;
+  const int row0 = blockIdx.x * rows_per_wave;
+  const int sub = lane % Lane::kLanes;
+  // A ragged tile reads the last valid row or token again; its results are
+  // never stored.
+  const std::uint8_t* row_ptr[rows_per_wave];
+#pragma unroll
+  for (int r = 0; r < rows_per_wave; ++r)
+    row_ptr[r] = weights + std::size_t(min(row0 + r, rows - 1)) *
+                               blocks_per_row * Lane::kBlockBytes;
+  const std::uint8_t* x[tokens];
+#pragma unroll
+  for (int j = 0; j < tokens; ++j)
+    x[j] = reinterpret_cast<const std::uint8_t*>(
+        input + std::size_t(min(first_token + j, n_tokens - 1)) * input_stride);
+  float acc[tokens][rows_per_wave] = {};
+  for (int kb = lane / Lane::kLanes + part * per_iter; kb < blocks_per_row;
+       kb += per_iter * ksplit) {
+    Lane w[rows_per_wave];
+#pragma unroll
+    for (int r = 0; r < rows_per_wave; ++r)
+      w[r] = Lane(row_ptr[r] + std::size_t(kb) * Lane::kBlockBytes, sub);
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+      const std::uint8_t* xb =
+          x[j] + std::size_t(kb) * Lane::kQ8Blocks * kQ8_1Bytes;
+#pragma unroll
+      for (int r = 0; r < rows_per_wave; ++r)
+        acc[j][r] = w[r].Dot(xb, sub, acc[j][r]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+    for (int r = 0; r < rows_per_wave; ++r)
+      acc[j][r] = warp_reduce_sum<32>(acc[j][r]);
+  }
+  constexpr int outputs = tokens * rows_per_wave;
+  const auto store = [&](int item, float value) {
+    const int token = first_token + item / rows_per_wave;
+    const int row = row0 + item % rows_per_wave;
+    if (token < n_tokens && row < rows)
+      output[std::size_t(token) * rows + row] = isfinite(value) ? value : 0.0f;
+  };
+  if constexpr (ksplit > 1) {
+    __shared__ float partial[kDenseTokenWaves][ksplit][outputs];
+    if (lane == 0) {
+#pragma unroll
+      for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+        for (int r = 0; r < rows_per_wave; ++r)
+          partial[threadIdx.z][part][j * rows_per_wave + r] = acc[j][r];
+      }
+    }
+    __syncthreads();
+    if (part != 0 || lane >= outputs)
+      return;
+    float value = partial[threadIdx.z][0][lane];
+#pragma unroll
+    for (int p = 1; p < ksplit; ++p)
+      value = __fadd_rn(value, partial[threadIdx.z][p][lane]);
+    store(lane, value);
+  } else {
+    // Every lane holds every sum after the butterfly; lane i stores item i.
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+#pragma unroll
+      for (int r = 0; r < rows_per_wave; ++r)
+        if (lane == j * rows_per_wave + r)
+          store(lane, acc[j][r]);
+    }
+  }
+}
+
+template<class Lane, int rows_per_wave, int ksplit, int tokens = 1>
+static void launch_dense_kq(const void* weights, const block_q8_1* input,
+                            float* output, int blocks_per_row, int rows,
+                            int n_tokens, int input_stride,
+                            hipStream_t stream) {
+  const auto* w = static_cast<const std::uint8_t*>(weights);
+  const int row_blocks = (rows + rows_per_wave - 1) / rows_per_wave;
+  if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+    if (n_tokens != tokens) {
+      launch_dense_kq<Lane, rows_per_wave, ksplit, tokens + 1>(
+          weights, input, output, blocks_per_row, rows, n_tokens,
+          input_stride, stream);
+      return;
+    }
+    mul_mat_vec_dense_kq<Lane, tokens, rows_per_wave, ksplit>
+        <<<dim3(row_blocks, 1), dim3(32, ksplit, 1), 0, stream>>>(
+            w, input, output, blocks_per_row, rows, input_stride, n_tokens);
+  } else {
+    // Eight tokens per wave, up to kDenseTokenWaves waves on the same rows.
+    const int waves =
+        std::min((n_tokens + tokens - 1) / tokens, kDenseTokenWaves);
+    const int per_block = waves * tokens;
+    mul_mat_vec_dense_kq<Lane, tokens, rows_per_wave, ksplit>
+        <<<dim3(row_blocks, (n_tokens + per_block - 1) / per_block),
+           dim3(32, ksplit, waves), 0, stream>>>(
+            w, input, output, blocks_per_row, rows, input_stride, n_tokens);
+  }
+}
+
+// Wide decode batches (9 to 64 rows) of the large Q4_K/Q5_K matrices take
+// int8 WMMA products of 16 tokens by 16 weight rows over each 32-wide
+// sub-block, scaled per sub-block. The eight waves of a block split K into
+// 64-wide chunks in a fixed order. A token's integer products and its scale
+// chain do not depend on the other tokens, so its result is the same at
+// every batch width above eight rows; it differs from the vector kernel's
+// in rounding only, like the Q8_0 W8A8 route for wide batches.
+constexpr int kDenseWmmaMinRows = 1024;
+
+template<bool five_bit, int token_tiles>
+__launch_bounds__(256) static __global__
+    void mul_mat_kq_decode_batch(const std::uint8_t* __restrict__ weights,
+                                 const block_q8_1* __restrict__ input,
+                                 float* __restrict__ output, int k, int rows,
+                                 int input_stride, int tokens) {
+  namespace lanes = gufo::models::qwen38_flash_next::kquant_lane;
+  using Int4 = __attribute__((ext_vector_type(4))) int;
+  using Int8 = __attribute__((ext_vector_type(8))) int;
+  constexpr int block_bytes = five_bit ? 176 : 144;
+  constexpr int quants = five_bit ? 48 : 16;
+  __shared__ float partial[8][token_tiles][8][32];
+  const int wave = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int sub = lane % 16;
+  const int half = lane / 16;
+  const int first_row = blockIdx.x * 16;
+  const int first_token = blockIdx.y * 16 * token_tiles;
+  const int super_blocks = k / QK_K;
+  // B operand: weight row `sub`; A operand: token `sub` of each tile. The
+  // product's element i in this lane is token 2i + half, row sub.
+  const std::uint8_t* row =
+      weights +
+      std::size_t(min(first_row + sub, rows - 1)) * super_blocks * block_bytes;
+  const block_q8_1* x[token_tiles];
+#pragma unroll
+  for (int t = 0; t < token_tiles; ++t)
+    x[t] = input +
+           std::size_t(min(first_token + t * 16 + sub, tokens - 1)) *
+               input_stride;
+  float acc[token_tiles][8] = {};
+  for (int chunk = wave; chunk < super_blocks * 4; chunk += 8) {
+    const int sb = chunk / 4;
+    const int c = chunk % 4;
+    const std::uint8_t* block = row + std::size_t(sb) * block_bytes;
+    const lanes::SubBlockScales scales =
+        lanes::DecodeScales(lanes::Load128(block), c);
+    // Sub-block 2c is the low nibbles of the chunk's 32 quant bytes, 2c + 1
+    // the high nibbles; each WMMA takes 16 of them.
+    Int4 w[2][2];
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      const lanes::Words4 q =
+          lanes::Load128(block + quants + 32 * c + 16 * part);
+      lanes::Words4 qh{};
+      if constexpr (five_bit)
+        qh = lanes::Load128(block + 16 + 16 * part);
+      std::uint32_t lo[4];
+      std::uint32_t hi[4];
+      lanes::UnpackQuants<five_bit>(q, qh, c, lo, hi);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        w[0][part][i] = static_cast<int>(lo[i]);
+        w[1][part][i] = static_cast<int>(hi[i]);
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < token_tiles; ++t) {
+      const block_q8_1* xb = x[t] + sb * (QK_K / QK8_1) + 2 * c;
+#pragma unroll
+      for (int s = 0; s < 2; ++s) {
+        const auto* qs = reinterpret_cast<const int*>(xb[s].qs);
+        Int8 dots{};
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+          const Int4 a = {qs[4 * part], qs[4 * part + 1], qs[4 * part + 2],
+                          qs[4 * part + 3]};
+          dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+              true, a, true, w[s][part], dots, false);
+        }
+        const int ds = __builtin_bit_cast(int, xb[s].ds);
+        const float scale = s == 0 ? scales.d0 : scales.d1;
+        const float minimum = s == 0 ? scales.m0 : scales.m1;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const std::uint32_t token_ds =
+              static_cast<std::uint32_t>(__shfl(ds, 2 * i + half, 32));
+          const float dx = lanes::HalfBits(token_ds & 0xFFFFU);
+          const float sx = lanes::HalfBits(token_ds >> 16);
+          acc[t][i] = lanes::Fma(lanes::Mul(scale, dx),
+                                 static_cast<float>(dots[i]), acc[t][i]);
+          acc[t][i] = lanes::Fma(-minimum, sx, acc[t][i]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < token_tiles; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      partial[wave][t][i][lane] = acc[t][i];
+  }
+  __syncthreads();
+  const int i = threadIdx.x / 32;
+#pragma unroll
+  for (int t = 0; t < token_tiles; ++t) {
+    float value = partial[0][t][i][lane];
+#pragma unroll
+    for (int w = 1; w < 8; ++w)
+      value = __fadd_rn(value, partial[w][t][i][lane]);
+    const int token = first_token + t * 16 + 2 * i + half;
+    const int r = first_row + sub;
+    if (token < tokens && r < rows)
+      output[std::size_t(token) * rows + r] = isfinite(value) ? value : 0.0f;
+  }
+}
+
+template<bool five_bit>
+static void launch_kq_decode_batch(const void* weights,
+                                   const block_q8_1* input, float* output,
+                                   int k, int rows, int tokens,
+                                   int input_stride, hipStream_t stream) {
+  const auto* w = static_cast<const std::uint8_t*>(weights);
+  const int tiles = std::min((tokens + 15) / 16, 4);
+  const dim3 grid((rows + 15) / 16, (tokens + 16 * tiles - 1) / (16 * tiles));
+  switch (tiles) {
+    case 1:
+      mul_mat_kq_decode_batch<five_bit, 1><<<grid, 256, 0, stream>>>(
+          w, input, output, k, rows, input_stride, tokens);
+      break;
+    case 2:
+      mul_mat_kq_decode_batch<five_bit, 2><<<grid, 256, 0, stream>>>(
+          w, input, output, k, rows, input_stride, tokens);
+      break;
+    case 3:
+      mul_mat_kq_decode_batch<five_bit, 3><<<grid, 256, 0, stream>>>(
+          w, input, output, k, rows, input_stride, tokens);
+      break;
+    default:
+      mul_mat_kq_decode_batch<five_bit, 4><<<grid, 256, 0, stream>>>(
+          w, input, output, k, rows, input_stride, tokens);
+      break;
+  }
+}
+
+// The kernel shape depends on the matrix only, never on the batch width.
+// Few rows (mixer down, shared gate/up) cannot fill the GPU one wave per row;
+// four waves split K. The short Q5_1 rows (K 320 and 640) take four rows per
+// wave.
+template<class Lane>
+static void launch_dense_shape(const void* weights, const block_q8_1* input,
+                               float* output, int k, int rows, int tokens,
+                               int input_stride, hipStream_t stream) {
+  const int blocks_per_row = k / (Lane::kQ8Blocks * QK8_1);
+  if (rows <= 1024) {
+    launch_dense_kq<Lane, 1, 4>(weights, input, output, blocks_per_row, rows,
+                                tokens, input_stride, stream);
+  } else if constexpr (Lane::kQ8Blocks == 1) {
+    launch_dense_kq<Lane, 4, 1>(weights, input, output, blocks_per_row, rows,
+                                tokens, input_stride, stream);
+  } else {
+    launch_dense_kq<Lane, 2, 1>(weights, input, output, blocks_per_row, rows,
+                                tokens, input_stride, stream);
+  }
 }
 
 void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
-                                const block_q8_1* input,
-                                const int32_t* zero_id, float* output, int k,
+                                const block_q8_1* input, float* output, int k,
                                 int rows, int tokens, int input_stride,
-                                hipStream_t stream) {
+                                hipStream_t stream, int route) {
+  namespace lanes = gufo::models::qwen38_flash_next::kquant_lane;
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && tokens > 0);
+  const bool wmma_type = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K;
+  GGML_ASSERT(route != 2 || wmma_type);
+  if (route == 2 ||
+      (route == 0 && wmma_type && tokens > MMVQ_MAX_BATCH_SIZE &&
+       rows >= kDenseWmmaMinRows)) {
+    if (type == GGML_TYPE_Q4_K)
+      launch_kq_decode_batch<false>(weights, input, output, k, rows, tokens,
+                                    input_stride, stream);
+    else
+      launch_kq_decode_batch<true>(weights, input, output, k, rows, tokens,
+                                   input_stride, stream);
+    return;
+  }
   switch (type) {
     case GGML_TYPE_Q4_K:
-      launch_dense<GGML_TYPE_Q4_K>(weights, input, zero_id, output, k, rows,
-                                   tokens, input_stride, stream);
+      launch_dense_shape<lanes::Q4KLane>(weights, input, output, k, rows,
+                                         tokens, input_stride, stream);
       break;
     case GGML_TYPE_Q5_K:
-      launch_dense<GGML_TYPE_Q5_K>(weights, input, zero_id, output, k, rows,
-                                   tokens, input_stride, stream);
+      launch_dense_shape<lanes::Q5KLane>(weights, input, output, k, rows,
+                                         tokens, input_stride, stream);
       break;
     case GGML_TYPE_Q6_K:
-      launch_dense<GGML_TYPE_Q6_K>(weights, input, zero_id, output, k, rows,
-                                   tokens, input_stride, stream);
+      launch_dense_shape<Q6KVecDotLane>(weights, input, output, k, rows,
+                                        tokens, input_stride, stream);
       break;
     case GGML_TYPE_Q5_1:
-      launch_dense<GGML_TYPE_Q5_1>(weights, input, zero_id, output, k, rows,
-                                   tokens, input_stride, stream);
+      launch_dense_shape<lanes::Q5_1Lane>(weights, input, output, k, rows,
+                                          tokens, input_stride, stream);
       break;
     default:
       GGML_ABORT("unsupported dense vector weight format");

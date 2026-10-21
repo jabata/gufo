@@ -1,12 +1,18 @@
 // Times the dense Flash-Next projections per weight format (diagnostic):
-// the Q8_0 decode GEMV against the Q4_K/Q5_K/Q6_K/Q5_1 vector kernel at 1, 4
-// and 8 rows, and the Q8_0 W8A8 prefill GEMM against the K-quant tiled GEMM.
-// Weights rotate through enough copies to exceed the last-level cache, as in
-// a full decode step where every projection is read from DRAM.
+// the Q8_0 decode kernels against the Q4_K/Q5_K/Q6_K/Q5_1 vector kernel at
+// 1 to 64 rows (MTP verification is streams x (draft + 1) rows), and the
+// Q8_0 W8A8 prefill GEMM against the K-quant tiled GEMM. Weights rotate
+// through enough copies to exceed the last-level cache, as in a full decode
+// step where every projection is read from DRAM.
 //
-// dense_kquant_bench [prefill_tokens] [reps]
+// dense_kquant_bench [prefill_tokens] [reps] [max_rows]
 //
-// Each line prints the median time and the weight bytes per second.
+// prefill_tokens 0 skips the prefill lines. Each decode line prints the
+// kernel (K-quant: auto is the production route, and Q4_K/Q5_K rows above
+// eight also time the vector and WMMA kernels forced; Q8_0: vec is the
+// decode GEMV, w8a8 the GEMM the executor runs above eight rows), the median
+// time, the weight bytes per second (the bandwidth the kernel achieves if it
+// reads each weight once) and the time per row.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -17,6 +23,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -113,6 +120,16 @@ double MedianUs(const std::function<void(int)>& launch, int reps) {
   return 1000.0 * ms[reps / 2];
 }
 
+/// The row counts qfn_mmq_q8_0_dense_vec_preq accepts for a matrix (the
+/// executor sends other wide Q8_0 batches to the tiled GEMM).
+bool Q8DecodeRows(std::size_t m, std::size_t k, int n) {
+  const bool wide = k == 2560 && m >= 8192 && n <= 48;
+  const bool grouped = n > 48 && n % 32 == 0 &&
+                       ((k == 2560 && m >= 1024) || (k == 320 && m == 10240));
+  const bool hc_down = m == 320 && k == 10240 && n % 8 == 0;
+  return n <= 32 || wide || grouped || hc_down;
+}
+
 struct Shape {
   const char* name;
   std::size_t m;
@@ -124,6 +141,7 @@ struct Shape {
 int main(int argc, char** argv) try {
   const std::size_t prefill = argc > 1 ? std::atoi(argv[1]) : 2048;
   const int reps = argc > 2 ? std::atoi(argv[2]) : 20;
+  const int max_rows = argc > 3 ? std::atoi(argv[3]) : 64;
   if (qfn_mmq_init(0) != 0)
     throw std::runtime_error("qfn_mmq_init");
   // Decode-time dense projections of one token (rows x reduction width).
@@ -141,12 +159,14 @@ int main(int argc, char** argv) try {
         formats.push_back(&f);
     // The output head is timed for decode only.
     const bool tiled = prefill > 0 && s.m < 100000;
-    const std::size_t rows = tiled ? std::max<std::size_t>(prefill, 8) : 8;
+    const std::size_t rows =
+        std::max<std::size_t>(tiled ? prefill : 0, std::max(max_rows, 1));
     float* x = Floats(rows * s.k, 7U);
     float* y = nullptr;
     CheckHip(hipMalloc(&y, rows * s.m * sizeof(float)), "hipMalloc");
     void* x_q8 = nullptr;
-    CheckHip(hipMalloc(&x_q8, qfn_mmq_q8_1_bytes(8, static_cast<int>(s.k))),
+    CheckHip(hipMalloc(&x_q8, qfn_mmq_q8_1_bytes(std::max(max_rows, 1),
+                                                 static_cast<int>(s.k))),
              "hipMalloc");
     for (const Format* f : formats) {
       const std::size_t bytes = s.m * (s.k / f->block) * f->bytes;
@@ -155,29 +175,63 @@ int main(int argc, char** argv) try {
       std::vector<void*> w;
       for (int c = 0; c < copies; ++c)
         w.push_back(Weights(*f, s.m, s.k, 100U + c));
-      for (const int n : {1, 4, 8}) {
+      // Q8_0 above eight rows runs the W8A8 GEMM in the executor.
+      void* xt_decode = nullptr;
+      if (f->ggml == 8) {
+        CheckHip(
+            hipMalloc(&xt_decode, q::Q8TiledBytes(std::max(max_rows, 1), s.k)),
+            "hipMalloc");
+      }
+      for (const int n : {1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64}) {
+        if (n > max_rows)
+          break;
         CheckHip(hipDeviceSynchronize(), "sync");
         if (qfn_mmq_quantize_q8_1(x, x_q8, n, static_cast<int>(s.k), nullptr) !=
             0)
           throw std::runtime_error("quantize");
-        const double us = MedianUs(
-            [&](int i) {
-              const int rc = f->ggml == 8
-                                 ? qfn_mmq_q8_0_dense_vec_preq(
-                                       w[i % copies], nullptr, x_q8, y,
-                                       static_cast<int>(s.m), n,
-                                       static_cast<int>(s.k), nullptr)
-                                 : qfn_mmq_kquant_dense_vec(
-                                       f->ggml, w[i % copies], nullptr, x_q8, y,
-                                       static_cast<int>(s.m), n,
-                                       static_cast<int>(s.k), nullptr);
-              if (rc != 0)
-                throw std::runtime_error("vector launch");
-            },
-            reps);
-        std::printf("decode  %-10s %6zux%-6zu %-4s n=%d %9.1f us %7.1f GB/s\n",
-                    s.name, s.m, s.k, f->name, n, us, bytes / us / 1e3);
+        // label, launch(weight copy) -> ok
+        std::vector<std::pair<const char*, std::function<bool(void*)>>> runs;
+        const int m = static_cast<int>(s.m);
+        const int k = static_cast<int>(s.k);
+        if (f->ggml == 8) {
+          if (Q8DecodeRows(s.m, s.k, n))
+            runs.emplace_back("vec", [&, n](void* wi) {
+              return qfn_mmq_q8_0_dense_vec_preq(wi, nullptr, x_q8, y, m, n, k,
+                                                 nullptr) == 0;
+            });
+          if (n > 8) {
+            q::QuantizeQ8Tiled(x, xt_decode, n, s.k, nullptr);
+            runs.emplace_back("w8a8", [&, n](void* wi) {
+              return q::W8A8Gemm(wi, xt_decode, y, n, s.m, s.k, nullptr);
+            });
+          }
+        } else {
+          // auto is the production route; Q4_K/Q5_K above eight rows also
+          // time each kernel forced, to place the vector/WMMA threshold.
+          constexpr const char* kRoutes[] = {"auto", "vec", "wmma"};
+          const bool both = (f->ggml == 12 || f->ggml == 13) && n > 8;
+          for (int route = 0; route < (both ? 3 : 1); ++route)
+            runs.emplace_back(kRoutes[route], [&, n, route](void* wi) {
+              return qfn_mmq_kquant_dense_vec_route(f->ggml, wi, x_q8, y, m, n,
+                                                    k, route, nullptr) == 0;
+            });
+        }
+        for (const auto& [label, run] : runs) {
+          const double us = MedianUs(
+              [&](int i) {
+                if (!run(w[i % copies]))
+                  throw std::runtime_error("decode launch");
+              },
+              reps);
+          std::printf(
+              "decode  %-10s %6zux%-6zu %-4s %-4s n=%-2d %9.1f us %7.1f GB/s "
+              "%7.2f us/row\n",
+              s.name, s.m, s.k, f->name, label, n, us, bytes / us / 1e3,
+              us / n);
+        }
       }
+      if (xt_decode != nullptr)
+        (void)hipFree(xt_decode);
       if (tiled) {
         void* xt = nullptr;
         if (f->ggml == 8) {
