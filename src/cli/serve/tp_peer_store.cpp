@@ -258,14 +258,18 @@ bool TpPeerStore::MakeRoom() {
   ++active_;
   ++counters_.spilled;
   auto ram = entry.ram;
-  const auto header = entry;
+  auto header = entry;
   lock.unlock();
-  Write(victim, std::move(ram), header, true);
+  Write(victim, std::move(ram), std::move(header), true);
   return true;
 }
 
 void TpPeerStore::Write(std::uint64_t key, std::shared_ptr<Ram> ram,
                         Entry header, bool drop_ram) {
+  // Only `ram` holds the bytes while they are written: a copy in the header
+  // (moved in by both callers) would keep the block allocated after Flush
+  // reports the write done.
+  header.ram.reset();
   const bool written = WriteFile(key, header, ram->bytes);
   ram.reset();
   {
@@ -551,7 +555,7 @@ void TpPeerStore::Writer() {
       header = found->second;
       ++active_;
     }
-    Write(key, std::move(ram), header, false);
+    Write(key, std::move(ram), std::move(header), false);
   }
 }
 
