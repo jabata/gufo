@@ -203,8 +203,9 @@ void TestMirror() {
     Settle(store);
     Require(store.Snapshot().disk_entries == 1 && pool.Free() == 2,
             "a published half is written and keeps its RAM copy while held");
+    Require(store.InRam(21), "a held half has a RAM copy");
     store.Release(21);
-    Require(pool.Free() == 3 && Loads(store, 21, 1, 7),
+    Require(pool.Free() == 3 && !store.InRam(21) && Loads(store, 21, 1, 7),
             "a release frees the RAM copy; the half loads from disk");
     store.Release(22);
     Require(pool.Free() == 4 && !Loads(store, 22, 0, 4),

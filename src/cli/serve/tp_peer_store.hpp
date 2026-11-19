@@ -86,6 +86,8 @@ public:
   void Load(std::uint64_t key, cache::ComponentId component, bool is_private,
             std::size_t first, std::size_t end, const Scratch& scratch,
             const Consume& consume);
+  /// Whether `key` has a RAM copy now (a load of it needs no disk read).
+  [[nodiscard]] bool InRam(std::uint64_t key) const;
   /// Rank 0's cache dropped its RAM copy of `key`.
   void Release(std::uint64_t key) noexcept;
   /// Rank 0 published `file`, which refers to `keys`.

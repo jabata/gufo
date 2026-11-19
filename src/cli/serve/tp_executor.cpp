@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -2230,6 +2231,104 @@ void TpExecutor::RunStored(const TpInstruction& job) {
       });
 }
 
+void TpExecutor::CopyStored(const TpInstruction& job,
+                            std::span<const std::byte> source) {
+  auto& slot = *slots_.at(job.state);
+  const cache::ComponentId id{job.component};
+  const bool whole = job.is_private != 0;
+  std::unique_ptr<cache::Stream> stream;
+  while ((stream = resources_->stream()) == nullptr) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+  auto completion = whole ? adapter_->LoadPrivate(slot, id, source, *stream)
+                          : adapter_->CopyRowsIn(slot, id, job.first, job.end,
+                                                 source, *stream);
+  if (completion.Wait() != cache::TransferResult::kSucceeded) {
+    throw std::runtime_error("device transfer failed");
+  }
+}
+
+void TpExecutor::QueueLoad(const TpInstruction& job) {
+  // Same checks as an inline load, before any read starts.
+  if (job.state >= slots_.size()) {
+    throw std::out_of_range("TP cache instruction names no slot");
+  }
+  const auto& descriptor = Descriptor(cache::ComponentId{job.component});
+  if ((job.is_private != 0) !=
+      (descriptor.kind == cache::ComponentKind::kPrivateState)) {
+    throw std::invalid_argument("TP stored transfer names the wrong component");
+  }
+  if (pending_loads_.size() >= read_ahead_) {
+    DrainOneLoad();
+  }
+  const auto index = free_load_buffers_.back();
+  free_load_buffers_.pop_back();
+  auto read = [this, job, index]() -> std::span<const std::byte> {
+    auto& buffer = load_buffers_[index];
+    const auto room = [&](std::size_t bytes) {
+      if (bytes > buffer.bytes.size()) {
+        const auto size = std::max<std::size_t>(std::bit_ceil(bytes), 1U << 20);
+        const std::lock_guard<std::mutex> lock(load_buffer_mutex_);
+        auto allocation = resources_->staging(size);
+        buffer.owner = std::move(allocation.owner);
+        buffer.bytes = {reinterpret_cast<std::byte*>(allocation.bytes.data()),
+                        size};
+      }
+      return buffer.bytes.first(bytes);
+    };
+    const bool whole = job.is_private != 0;
+    std::span<const std::byte> out;
+    store_->Load(
+        job.key, cache::ComponentId{job.component}, whole,
+        whole ? 0 : job.key_first,
+        whole ? 1 : job.key_first + (job.end - job.first), room,
+        [&](std::span<const std::byte> source) {
+          const auto* begin = buffer.bytes.data();
+          if (begin != nullptr && source.data() >= begin &&
+              source.data() + source.size() <= begin + buffer.bytes.size()) {
+            out = source;  // read from disk into this buffer
+            return;
+          }
+          // A RAM copy may go once Load returns: keep the bytes.
+          auto destination = room(source.size());
+          std::memcpy(destination.data(), source.data(), source.size());
+          out = destination;
+        });
+    return out;
+  };
+  try {
+    pending_loads_.push_back(
+        {job, index, std::async(std::launch::async, std::move(read))});
+  } catch (...) {
+    free_load_buffers_.push_back(index);
+    throw;
+  }
+}
+
+void TpExecutor::DrainOneLoad() noexcept {
+  auto pending = std::move(pending_loads_.front());
+  pending_loads_.pop_front();
+  try {
+    try {
+      CopyStored(pending.instruction, pending.read.get());
+    } catch (const std::exception& exception) {
+      Logger::Warn("tp", std::string("event=tp_peer_store_failed op=") +
+                             std::string(OpName(pending.instruction.op)) +
+                             " reason=" + exception.what());
+      failed_restores_.insert(pending.instruction.state);
+    }
+  } catch (...) {
+    failed_restores_.insert(pending.instruction.state);
+  }
+  free_load_buffers_.push_back(pending.buffer);
+}
+
+void TpExecutor::DrainLoads() noexcept {
+  while (!pending_loads_.empty()) {
+    DrainOneLoad();
+  }
+}
+
 const cache::ComponentDescriptor& TpExecutor::Descriptor(
     cache::ComponentId id) const {
   for (const auto& descriptor : adapter_->Components()) {
@@ -2289,8 +2388,21 @@ TpExecutor::TpExecutor(std::shared_ptr<TextModelRunner> runner,
   Logger::Info("tp", "event=tp_peer_store_configured ram_bytes=" +
                          std::to_string(store.ram_bytes) + " disk_mirror=" +
                          (store.disk_directory.empty() ? "off" : "on"));
+  const bool disk_tier = !store.disk_directory.empty();
   store_ =
       std::make_unique<TpPeerStore>(resources_->allocate, std::move(store));
+  // Disk loads are separate small reads; reading several ahead overlaps them
+  // (GUFO_TP_LOAD_READAHEAD=0 loads each inline, as before).
+  read_ahead_ = disk_tier ? 8 : 0;
+  if (const char* value = std::getenv("GUFO_TP_LOAD_READAHEAD")) {
+    read_ahead_ = std::min<std::size_t>(std::strtoul(value, nullptr, 10), 32);
+  }
+  load_buffers_.resize(read_ahead_);
+  for (std::size_t i = read_ahead_; i > 0; --i) {
+    free_load_buffers_.push_back(i - 1);
+  }
+  Logger::Info("tp",
+               "event=tp_load_read_ahead depth=" + std::to_string(read_ahead_));
   bulk_->Start();
   // Rank 0's scheduler prepares its vocabulary before serving; rank 1 would
   // otherwise build its own inside the first constrained request, while rank 0
@@ -2346,6 +2458,11 @@ bool TpExecutor::EndScope(std::uint64_t index, std::string* error) {
 
 bool TpExecutor::Execute(const TpControlCommand& command,
                          const Respond& respond, std::string* error) {
+  // Queued loads land before anything else runs, in their channel order.
+  if (command.kind == TpControlCommandKind::kSingle ||
+      command.instruction.op != TpInstructionOp::kLoadStashed) {
+    DrainLoads();
+  }
   if (command.kind == TpControlCommandKind::kSingle) {
     return Open(command, error);
   }
@@ -2508,7 +2625,17 @@ bool TpExecutor::ExecuteCacheOp(std::uint64_t sequence,
         // Unanswered: a failed stash leaves its key missing, and a failed
         // load fails the restore's validation.
         try {
-          RunStored(instruction);
+          // Only disk reads go ahead; a RAM copy loads inline as before,
+          // after the queued loads, so the copies keep the channel order.
+          if (instruction.op == TpInstructionOp::kLoadStashed &&
+              read_ahead_ != 0 && !store_->InRam(instruction.key)) {
+            QueueLoad(instruction);
+          } else {
+            if (instruction.op == TpInstructionOp::kLoadStashed) {
+              DrainLoads();
+            }
+            RunStored(instruction);
+          }
         } catch (const std::exception& exception) {
           Logger::Warn("tp", std::string("event=tp_peer_store_failed op=") +
                                  std::string(OpName(instruction.op)) +

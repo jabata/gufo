@@ -404,6 +404,12 @@ void TpPeerStore::Load(std::uint64_t key, cache::ComponentId component,
   consume(std::span<const std::byte>(bytes).subspan(offset, length));
 }
 
+bool TpPeerStore::InRam(std::uint64_t key) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto found = entries_.find(key);
+  return found != entries_.end() && found->second.ram != nullptr;
+}
+
 TpPeerStore::Early& TpPeerStore::EarlyLocked(std::uint64_t key) {
   auto [found, inserted] = early_.try_emplace(key);
   if (inserted) {

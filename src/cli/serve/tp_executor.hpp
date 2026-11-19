@@ -5,7 +5,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -399,6 +401,16 @@ private:
   void RunStored(const TpInstruction& instruction);
   /// Host memory for a load read back from disk.
   [[nodiscard]] std::span<std::byte> Staging(std::size_t bytes);
+  /// Queues a kLoadStashed whose bytes a worker reads (disk read and checksum)
+  /// while the channel goes on; DrainLoads copies them in, in order.
+  void QueueLoad(const TpInstruction& instruction);
+  /// Copies every queued load in, oldest first, before any other instruction
+  /// runs; a failed one fails its slot's restore as an inline load does.
+  void DrainLoads() noexcept;
+  void DrainOneLoad() noexcept;
+  /// Copies a load's bytes into its slot on this thread.
+  void CopyStored(const TpInstruction& instruction,
+                  std::span<const std::byte> source);
   [[nodiscard]] const cache::ComponentDescriptor& Descriptor(
       cache::ComponentId id) const;
   [[nodiscard]] bool TakeIndex(const TpControlCommand& command,
@@ -428,6 +440,23 @@ private:
   std::unordered_set<std::uint32_t> failed_restores_;
   std::shared_ptr<void> staging_owner_;
   std::span<std::byte> staging_;
+  /// Read-ahead of queued disk loads (GUFO_TP_LOAD_READAHEAD, default 8).
+  struct LoadBuffer {
+    std::shared_ptr<void> owner;
+    std::span<std::byte> bytes;
+  };
+  struct PendingLoad {
+    TpInstruction instruction;
+    std::size_t buffer{0};
+    std::future<std::span<const std::byte>> read;
+  };
+  std::size_t read_ahead_{0};
+  std::mutex load_buffer_mutex_;
+  std::vector<LoadBuffer> load_buffers_;
+  std::vector<std::size_t> free_load_buffers_;
+  /// After the buffers and the store it reads: its futures wait on
+  /// destruction.
+  std::deque<PendingLoad> pending_loads_;
   /// Last: its thread uses the store above.
   std::unique_ptr<Bulk> bulk_;
 };

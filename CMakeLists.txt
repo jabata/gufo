@@ -889,6 +889,11 @@ endfunction()
   target_link_libraries(tp_executor_test PRIVATE gufo_cache_fake gufo_serving)
   add_test(NAME tp_executor_test COMMAND tp_executor_test)
   set_tests_properties(tp_executor_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 60)
+  # The same cases with rank 1 reading its stored loads ahead (the default
+  # with a disk tier, which these toy runs do not configure).
+  add_test(NAME tp_executor_read_ahead_test COMMAND tp_executor_test)
+  set_tests_properties(tp_executor_read_ahead_test PROPERTIES
+    LABELS "cpu;tp2" TIMEOUT 60 ENVIRONMENT "GUFO_TP_LOAD_READAHEAD=8")
   endif()
   add_executable(transcribe_cli_test
     tests/cli/transcribe_test.cpp
