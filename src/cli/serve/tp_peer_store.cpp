@@ -1,10 +1,14 @@
 #include "src/cli/serve/tp_peer_store.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -21,6 +25,10 @@ namespace {
 constexpr std::uint32_t kFileMagic = 0x31535054U;  // "TPS1"
 constexpr std::uint32_t kFileVersion = 1;
 constexpr std::string_view kFileSuffix = ".tps";
+// Recover reads the file headers on up to this many threads, each taking at
+// least this many files.
+constexpr std::size_t kRecoverThreads = 16;
+constexpr std::size_t kRecoverPerThread = 256;
 constexpr std::string_view kIndexName = "files.idx";
 /// Index records are op, private flag, file id, key count, keys, checksum.
 constexpr std::size_t kMaxIndexKeys = std::size_t{1} << 24;
@@ -602,46 +610,98 @@ void TpPeerStore::Recover() {
       ++referred[key];
     }
   }
-  // Then the halves those keys name; any other file is unreferenced.
+  // Then the halves those keys name; any other file is unreferenced. A full
+  // disk tier holds one file per half (a hundred thousand or more), and
+  // rank 0's first request waits for this scan, so the header reads run on
+  // several threads: on a cold page cache each one is a separate device read.
   struct Found {
     std::uint64_t key;
     Entry entry;
     std::filesystem::file_time_type time;
   };
-  std::vector<Found> found;
+  std::vector<std::filesystem::path> paths;
   std::size_t discarded = 0;
   for (const auto& item :
        std::filesystem::directory_iterator(options_.disk_directory, error)) {
-    const auto path = item.path();
+    const auto& path = item.path();
     if (path.filename() == kIndexName) {
       continue;
     }
-    const bool ours = path.extension() == kFileSuffix;
+    paths.push_back(path);
+  }
+  std::vector<std::optional<Found>> scanned(paths.size());
+  const auto scan = [&](std::size_t i) {
+    const auto& path = paths[i];
+    std::error_code file_error;
     FileHeader header{};
     bool valid = false;
-    if (ours && item.is_regular_file()) {
+    if (path.extension() == kFileSuffix &&
+        std::filesystem::is_regular_file(path, file_error)) {
       std::ifstream in(path, std::ios::binary);
       in.read(reinterpret_cast<char*>(&header), sizeof(header));
       valid = static_cast<bool>(in) && header.magic == kFileMagic &&
               header.version == kFileVersion && header.key != 0 &&
               header.rows != 0 && header.bytes % header.rows == 0 &&
-              item.file_size() == sizeof(header) + header.bytes &&
-              path.stem() == Hex(header.key) && referred.contains(header.key);
+              std::filesystem::file_size(path, file_error) ==
+                  sizeof(header) + header.bytes &&
+              !file_error && path.stem() == Hex(header.key) &&
+              referred.contains(header.key);
     }
     if (!valid) {
-      std::filesystem::remove(path, error);
-      ++discarded;
-      continue;
+      std::filesystem::remove(path, file_error);
+      return;
     }
-    found.push_back({header.key,
-                     Entry{.component = header.component,
-                           .is_private = header.is_private != 0,
-                           .rows = header.rows,
-                           .bytes = header.bytes,
-                           .on_disk = true,
-                           .released = true,
-                           .files = referred.at(header.key)},
-                     item.last_write_time()});
+    const auto time = std::filesystem::last_write_time(path, file_error);
+    scanned[i] = Found{header.key,
+                       Entry{.component = header.component,
+                             .is_private = header.is_private != 0,
+                             .rows = header.rows,
+                             .bytes = header.bytes,
+                             .on_disk = true,
+                             .released = true,
+                             .files = referred.at(header.key)},
+                       time};
+  };
+  {
+    const std::size_t workers = std::min<std::size_t>(
+        kRecoverThreads,
+        (paths.size() + kRecoverPerThread - 1) / kRecoverPerThread);
+    std::atomic<std::size_t> next{0};
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    const auto work = [&] {
+      try {
+        for (std::size_t i = next++; i < paths.size(); i = next++) {
+          scan(i);
+        }
+      } catch (...) {
+        next = paths.size();
+        const std::lock_guard<std::mutex> lock(failure_mutex);
+        if (!failure) {
+          failure = std::current_exception();
+        }
+      }
+    };
+    std::vector<std::thread> threads;
+    for (std::size_t t = 1; t < workers; ++t) {
+      threads.emplace_back(work);
+    }
+    work();
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
+  }
+  std::vector<Found> found;
+  found.reserve(paths.size());
+  for (auto& item : scanned) {
+    if (item) {
+      found.push_back(std::move(*item));
+    } else {
+      ++discarded;
+    }
   }
   std::ranges::sort(found, {}, &Found::time);
   for (auto& item : found) {

@@ -341,6 +341,46 @@ void TestPressure() {
   }
 }
 
+void TestRecoverMany() {
+  // Enough halves that the restart scans them on several threads, plus a
+  // corrupt half and a stray file, which the scan removes.
+  constexpr std::uint64_t kHalves = 1200;
+  const auto root = TemporaryRoot("many");
+  const TpPeerStoreOptions options{.disk_directory = root};
+  {
+    Pool pool(kHalves, 64);
+    TpPeerStore store(pool.Allocator(), options);
+    std::vector<std::uint64_t> keys;
+    for (std::uint64_t key = 1; key <= kHalves; ++key) {
+      Stash(store, key, 4);
+      keys.push_back(key);
+    }
+    Publish(store, 7, keys);
+    Settle(store);
+    for (const auto key : keys) {
+      store.Release(key);
+    }
+    Require(store.Snapshot().disk_entries == kHalves && Halves(root) == kHalves,
+            "every published half is on disk");
+  }
+  std::ofstream(root / "tp2-peer" / "ffffffffffff0001.tps") << "torn";
+  std::ofstream(root / "tp2-peer" / "stray.tmp") << "stray";
+  {
+    Pool pool(4, 64);
+    TpPeerStore store(pool.Allocator(), options);
+    Require(store.Snapshot().disk_entries == kHalves &&
+                Halves(root) == kHalves &&
+                !std::filesystem::exists(root / "tp2-peer" / "stray.tmp"),
+            "a restart recovers every half and removes the others");
+    bool all = true;
+    for (std::uint64_t key = 1; key <= kHalves && all; ++key) {
+      all = Loads(store, key, 1, 4);
+    }
+    Require(all, "every recovered half loads");
+  }
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
@@ -350,6 +390,7 @@ int main() {
   TestEarlyNotices();
   TestCorruptEntry();
   TestPressure();
+  TestRecoverMany();
   std::cout << "PASS: TP peer store keeps rank 1's checkpoint halves\n";
   return 0;
 }
