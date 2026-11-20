@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -382,6 +383,50 @@ void TestRecoverMany() {
   std::filesystem::remove_all(root);
 }
 
+void TestWarmDisk() {
+  // Rank 1 reads the stored halves' headers during its model load; it only
+  // reads, so the store opened afterwards recovers exactly as without it.
+  constexpr std::uint64_t kHalves = 600;
+  const auto root = TemporaryRoot("warm");
+  const TpPeerStoreOptions options{.disk_directory = root};
+  Require(TpPeerStore::WarmDisk(root, {}) == 0,
+          "warming a missing directory reads nothing");
+  {
+    Pool pool(kHalves, 64);
+    TpPeerStore store(pool.Allocator(), options);
+    std::vector<std::uint64_t> keys;
+    for (std::uint64_t key = 1; key <= kHalves; ++key) {
+      Stash(store, key, 4);
+      keys.push_back(key);
+    }
+    Publish(store, 7, keys);
+    Settle(store);
+    for (const auto key : keys) {
+      store.Release(key);
+    }
+  }
+  std::ofstream(root / "tp2-peer" / "ffffffffffff0001.tps") << "torn";
+  std::stop_source stopped;
+  stopped.request_stop();
+  Require(TpPeerStore::WarmDisk(root, stopped.get_token()) == 0,
+          "a stopped warm-up reads nothing");
+  Require(TpPeerStore::WarmDisk(root, {}, 4) == kHalves,
+          "the warm-up reads every whole header, not the torn file");
+  Require(Halves(root) == kHalves + 1, "the warm-up removes nothing");
+  {
+    Pool pool(4, 64);
+    TpPeerStore store(pool.Allocator(), options);
+    Require(store.Snapshot().disk_entries == kHalves && Halves(root) == kHalves,
+            "a store opened after the warm-up recovers every half");
+    bool all = true;
+    for (std::uint64_t key = 1; key <= kHalves && all; ++key) {
+      all = Loads(store, key, 1, 4);
+    }
+    Require(all, "every half loads after the warm-up");
+  }
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
@@ -392,6 +437,7 @@ int main() {
   TestCorruptEntry();
   TestPressure();
   TestRecoverMany();
+  TestWarmDisk();
   std::cout << "PASS: TP peer store keeps rank 1's checkpoint halves\n";
   return 0;
 }

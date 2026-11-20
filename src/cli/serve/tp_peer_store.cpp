@@ -565,6 +565,51 @@ void TpPeerStore::Writer() {
   }
 }
 
+std::size_t TpPeerStore::WarmDisk(const std::filesystem::path& disk_directory,
+                                  std::stop_token stop, std::size_t threads) {
+  try {
+    std::error_code error;
+    std::vector<std::filesystem::path> paths;
+    for (const auto& item : std::filesystem::directory_iterator(
+             disk_directory / "tp2-peer", error)) {
+      if (stop.stop_requested()) {
+        return 0;
+      }
+      if (item.path().extension() == kFileSuffix) {
+        paths.push_back(item.path());
+      }
+    }
+    // The same reads Recover makes: the inode and the header block.
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> read{0};
+    const auto work = [&] {
+      for (std::size_t i = next++; i < paths.size() && !stop.stop_requested();
+           i = next++) {
+        std::error_code file_error;
+        (void)std::filesystem::file_size(paths[i], file_error);
+        FileHeader header{};
+        std::ifstream in(paths[i], std::ios::binary);
+        if (in.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+          ++read;
+        }
+      }
+    };
+    const std::size_t workers = std::clamp<std::size_t>(
+        (paths.size() + kRecoverPerThread - 1) / kRecoverPerThread, 1,
+        std::max<std::size_t>(threads, 1));
+    std::vector<std::jthread> pool;
+    for (std::size_t t = 1; t < workers; ++t) {
+      pool.emplace_back(work);
+    }
+    work();
+    pool.clear();
+    return read.load();
+  } catch (...) {
+    // Only a hint for the page cache: Recover reports real failures.
+    return 0;
+  }
+}
+
 void TpPeerStore::Recover() {
   std::error_code error;
   std::filesystem::create_directories(options_.disk_directory, error);

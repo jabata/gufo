@@ -19,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -39,6 +40,9 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/tp_control.hpp"
+#if defined(GUFO_HAS_TP2_CONTROL)
+#include "src/cli/serve/tp_peer_store.hpp"
+#endif
 #include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
@@ -1959,6 +1963,33 @@ int RunServe(std::span<const char* const> args) {
     if (tp_world_size != 2 || tp_rank != 1) {
       loading.emplace(host, port);
     }
+#if defined(GUFO_HAS_TP2_CONTROL)
+    // Rank 1 recovers its disk mirror after the model loads, one header read
+    // per stored half, and rank 0's first request waits for that. Read them
+    // into the page cache during the load instead (GUFO_TP_STORE_WARM=0
+    // skips it); the thread stops and joins once the load returns.
+    std::jthread tp_store_warm;
+    if (tp_world_size == 2 && tp_rank == 1 && !cache_disk_directory.empty() &&
+        cache_disk_bytes != 0) {
+      const char* warm = std::getenv("GUFO_TP_STORE_WARM");
+      if (warm == nullptr || std::string_view(warm) != "0") {
+        tp_store_warm = std::jthread(
+            [directory = cache_disk_directory](const std::stop_token& stop) {
+              const auto start = std::chrono::steady_clock::now();
+              const auto files = server::TpPeerStore::WarmDisk(directory, stop);
+              server::Logger::Info(
+                  "tp",
+                  "event=tp_peer_store_warmed files=" + std::to_string(files) +
+                      " elapsed_ms=" +
+                      std::to_string(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count()) +
+                      (stop.stop_requested() ? " stopped=1" : ""));
+            });
+      }
+    }
+#endif
     const bool load_ok = backend->load(
         model, &err, max_context, session_count,
         server::TextSchedulerPolicy{
@@ -2002,6 +2033,9 @@ int RunServe(std::span<const char* const> args) {
     if (loading) {
       loading->stop();
     }
+#if defined(GUFO_HAS_TP2_CONTROL)
+    tp_store_warm = {};
+#endif
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;

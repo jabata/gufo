@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stop_token>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -72,6 +73,13 @@ public:
   using Scratch = std::function<std::span<std::byte>(std::size_t)>;
 
   TpPeerStore(Allocate allocate, TpPeerStoreOptions options);
+  /// Reads the header of every stored half under `disk_directory` (the
+  /// directory TpPeerStoreOptions names) once and discards it, so that a store
+  /// opened there later recovers from the page cache instead of one device
+  /// read per file. Rank 1 runs it beside its model load. Returns the files
+  /// read; stops early once `stop` is requested and never throws.
+  static std::size_t WarmDisk(const std::filesystem::path& disk_directory,
+                              std::stop_token stop, std::size_t threads = 8);
   ~TpPeerStore();
   TpPeerStore(const TpPeerStore&) = delete;
   TpPeerStore& operator=(const TpPeerStore&) = delete;
